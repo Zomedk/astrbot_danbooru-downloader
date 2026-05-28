@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import re
+import uuid
 from pathlib import Path
 from typing import Dict, List
 
@@ -80,17 +81,21 @@ class DanbooruDownloaderPlugin(Star):
                     return ""
                 
                 ext = Path(url).suffix
-                filename = f"temp_{random.randint(1000, 9999)}{ext}"
+                filename = f"temp_{uuid.uuid4().hex}{ext}"
                 save_path = self.temp_dir / filename
                 
-                with open(save_path, 'wb') as f:
-                    f.write(await response.read())
+                content = await response.read()
+                await asyncio.to_thread(self._write_file, save_path, content)
                 
                 return str(save_path)
                 
         except Exception as e:
             logger.error(f"下载图片失败: {e}")
             return ""
+    
+    def _write_file(self, path: Path, content: bytes):
+        with open(path, 'wb') as f:
+            f.write(content)
 
     @filter.command("美图")
     async def handle_meitu_command(self, event: AstrMessageEvent):
@@ -117,6 +122,7 @@ class DanbooruDownloaderPlugin(Star):
         
         yield event.plain_result(f"正在获取 [{char_name}] 的美图...")
         
+        local_path = ""
         try:
             async with aiohttp.ClientSession() as session:
                 image_url = await self._fetch_random_image(session, username, api_key, CHARACTERS_MAP[char_name])
@@ -134,12 +140,16 @@ class DanbooruDownloaderPlugin(Star):
                 # 发送图片（使用旧版API的方式）
                 yield event.image_result(local_path)
                 
-                # 清理临时文件
-                os.remove(local_path)
-                
         except Exception as e:
             logger.error(f"发送美图失败: {e}")
             yield event.plain_result(f"发送失败: {str(e)}")
+        finally:
+            # 确保无论如何都清理临时文件
+            if local_path and os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except Exception as e:
+                    logger.error(f"清理临时文件失败: {e}")
     
     @filter.command("美图角色")
     async def handle_characters_command(self, event: AstrMessageEvent):
