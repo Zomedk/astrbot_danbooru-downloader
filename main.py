@@ -11,6 +11,7 @@ from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Plain, Image
+from astrbot.core.message.components import Node, Nodes
 
 
 CHARACTERS_MAP = {
@@ -35,43 +36,25 @@ IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
 
 @register("astrbot_danbooru_downloader", "Zomedk", "Danbooru美图插件", "1.0.0")
 class DanbooruDownloaderPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.plugin_dir = Path(__file__).parent
         self.temp_dir = self.plugin_dir / "temp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
-        # 加载配置
-        self.username = ""
-        self.api_key = ""
-        self._load_config()
-    
-    def _load_config(self):
-        """加载配置"""
-        try:
-            # 尝试从 context.config 获取
-            if hasattr(self.context, 'config') and self.context.config:
-                self.username = self.context.config.get("username", "")
-                self.api_key = self.context.config.get("api_key", "")
-                if self.username:
-                    logger.info(f"从 context.config 加载配置成功: username={self.username}")
-            
-            # 如果没读到，尝试从 context.plugin_config 获取
-            if not self.username and hasattr(self.context, 'plugin_config') and self.context.plugin_config:
-                self.username = self.context.plugin_config.get("username", "")
-                self.api_key = self.context.plugin_config.get("api_key", "")
-                if self.username:
-                    logger.info(f"从 context.plugin_config 加载配置成功: username={self.username}")
-            
-            # 如果还没读到，尝试从 context 直接属性获取
-            if not self.username and hasattr(self.context, 'username'):
-                self.username = self.context.username
-                self.api_key = getattr(self.context, 'api_key', '')
-                if self.username:
-                    logger.info(f"从 context 属性加载配置成功: username={self.username}")
-                    
-        except Exception as e:
-            logger.error(f"加载配置失败: {e}")
+        # 保存配置
+        self.config = config if config else {}
+        
+        # 读取配置
+        self.username = self.config.get("username", "")
+        self.api_key = self.config.get("api_key", "")
+        # 发送方式：direct=直接发送，forward=转发消息（更安全）
+        self.send_mode = self.config.get("send_mode", "forward")
+        
+        if self.username:
+            logger.info(f"Danbooru插件配置加载成功: username={self.username}, send_mode={self.send_mode}")
+        else:
+            logger.warning("Danbooru插件配置未找到 username 或 api_key")
     
     async def _fetch_random_image(self, session: aiohttp.ClientSession, username: str, api_key: str, tag: str) -> str:
         url = "https://danbooru.donmai.us/posts.json"
@@ -128,6 +111,37 @@ class DanbooruDownloaderPlugin(Star):
     def _write_file(self, path: Path, content: bytes):
         with open(path, 'wb') as f:
             f.write(content)
+    
+    async def _send_as_forward(self, event: AstrMessageEvent, image_path: str, character_name: str) -> None:
+        """使用转发消息发送图片（更安全，不易被风控）"""
+        try:
+            # 获取机器人自身ID
+            self_id = str(event.get_self_id() or "123456")
+            
+            # 构建转发消息节点
+            node = Node(
+                name="Danbooru美图",
+                uin=self_id,
+                content=[
+                    Plain(f"🎨 {character_name} 的美图\n"),
+                    Image(file=image_path),
+                    Plain(f"\n📝 来源: Danbooru | 仅供欣赏")
+                ]
+            )
+            
+            forward_msg = Nodes(nodes=[node])
+            yield event.chain_result([forward_msg])
+            logger.info(f"已通过转发消息发送图片: {character_name}")
+            
+        except Exception as e:
+            logger.error(f"转发消息发送失败，降级为直接发送: {e}")
+            # 降级处理
+            yield event.image_result(image_path)
+    
+    async def _send_as_direct(self, event: AstrMessageEvent, image_path: str, character_name: str) -> None:
+        """直接发送图片"""
+        yield event.image_result(image_path)
+        logger.info(f"已直接发送图片: {character_name}")
 
     @filter.command("美图")
     async def handle_meitu_command(self, event: AstrMessageEvent):
@@ -144,7 +158,7 @@ class DanbooruDownloaderPlugin(Star):
             yield event.plain_result(f"未知角色！支持的角色：\n{chars}")
             return
         
-        # 使用初始化时加载的配置
+        # 检查配置
         if not self.username or not self.api_key:
             yield event.plain_result("请先在插件配置中填写Danbooru用户名和API Key")
             return
@@ -166,8 +180,11 @@ class DanbooruDownloaderPlugin(Star):
                     yield event.plain_result("下载图片失败")
                     return
                 
-                # 发送图片
-                yield event.image_result(local_path)
+                # 根据配置选择发送方式
+                if self.send_mode == "forward":
+                    await self._send_as_forward(event, local_path, char_name)
+                else:
+                    await self._send_as_direct(event, local_path, char_name)
                 
         except Exception as e:
             logger.error(f"发送美图失败: {e}")

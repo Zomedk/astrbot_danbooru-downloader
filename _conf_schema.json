@@ -2,11 +2,20 @@
     "username": {
         "description": "Danbooru 用户名",
         "type": "string",
-        "hint": "填写你在 danbooru.donmai.us 的用户名"
+        "hint": "填写你在 danbooru.donmai.us 的用户名",
+        "default": ""
     },
     "api_key": {
         "description": "Danbooru API Key",
         "type": "string",
-        "hint": "在 Danbooru 账户设置中获取"
+        "hint": "在 Danbooru 账户设置中获取",
+        "default": ""
+    },
+    "send_mode": {
+        "description": "发送方式",
+        "type": "string",
+        "hint": "direct=直接发送, forward=转发消息(更安全)",
+        "default": "forward",
+        "options": ["direct", "forward"]
     }
 }
