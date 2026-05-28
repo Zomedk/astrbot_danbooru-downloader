@@ -1,0 +1,59 @@
+{
+  "conf_schema": [
+    {
+      "type": "section",
+      "title": "Danbooru API配置",
+      "children": [
+        {
+          "type": "text",
+          "name": "username",
+          "label": "用户名",
+          "required": true,
+          "placeholder": "Danbooru用户名"
+        },
+        {
+          "type": "password",
+          "name": "api_key",
+          "label": "API Key",
+          "required": true,
+          "placeholder": "Danbooru API Key"
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "title": "下载设置",
+      "children": [
+        {
+          "type": "number",
+          "name": "max_workers",
+          "label": "并发下载数",
+          "default": 10,
+          "min": 1,
+          "max": 20
+        },
+        {
+          "type": "number",
+          "name": "target_count",
+          "label": "每个角色下载数量",
+          "default": 50,
+          "min": 10,
+          "max": 200
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "title": "角色列表",
+      "children": [
+        {
+          "type": "textarea",
+          "name": "characters",
+          "label": "角色列表（JSON格式）",
+          "default": "[\"拉姆\", \"雷姆\", \"胡桃\"]",
+          "placeholder": "JSON数组，格式: [\"角色1\", \"角色2\"]"
+        }
+      ]
+    }
+  ]
+}
