@@ -40,6 +40,38 @@ class DanbooruDownloaderPlugin(Star):
         self.plugin_dir = Path(__file__).parent
         self.temp_dir = self.plugin_dir / "temp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 加载配置
+        self.username = ""
+        self.api_key = ""
+        self._load_config()
+    
+    def _load_config(self):
+        """加载配置"""
+        try:
+            # 尝试从 context.config 获取
+            if hasattr(self.context, 'config') and self.context.config:
+                self.username = self.context.config.get("username", "")
+                self.api_key = self.context.config.get("api_key", "")
+                if self.username:
+                    logger.info(f"从 context.config 加载配置成功: username={self.username}")
+            
+            # 如果没读到，尝试从 context.plugin_config 获取
+            if not self.username and hasattr(self.context, 'plugin_config') and self.context.plugin_config:
+                self.username = self.context.plugin_config.get("username", "")
+                self.api_key = self.context.plugin_config.get("api_key", "")
+                if self.username:
+                    logger.info(f"从 context.plugin_config 加载配置成功: username={self.username}")
+            
+            # 如果还没读到，尝试从 context 直接属性获取
+            if not self.username and hasattr(self.context, 'username'):
+                self.username = self.context.username
+                self.api_key = getattr(self.context, 'api_key', '')
+                if self.username:
+                    logger.info(f"从 context 属性加载配置成功: username={self.username}")
+                    
+        except Exception as e:
+            logger.error(f"加载配置失败: {e}")
     
     async def _fetch_random_image(self, session: aiohttp.ClientSession, username: str, api_key: str, tag: str) -> str:
         url = "https://danbooru.donmai.us/posts.json"
@@ -112,11 +144,8 @@ class DanbooruDownloaderPlugin(Star):
             yield event.plain_result(f"未知角色！支持的角色：\n{chars}")
             return
         
-        # 获取配置（与赛尔号插件相同的方式）
-        username = self.context.plugin_config.get("username", "") if hasattr(self.context, 'plugin_config') else ""
-        api_key = self.context.plugin_config.get("api_key", "") if hasattr(self.context, 'plugin_config') else ""
-        
-        if not username or not api_key:
+        # 使用初始化时加载的配置
+        if not self.username or not self.api_key:
             yield event.plain_result("请先在插件配置中填写Danbooru用户名和API Key")
             return
         
@@ -125,7 +154,7 @@ class DanbooruDownloaderPlugin(Star):
         local_path = ""
         try:
             async with aiohttp.ClientSession() as session:
-                image_url = await self._fetch_random_image(session, username, api_key, CHARACTERS_MAP[char_name])
+                image_url = await self._fetch_random_image(session, self.username, self.api_key, CHARACTERS_MAP[char_name])
                 
                 if not image_url:
                     yield event.plain_result(f"未找到角色 [{char_name}] 的图片")
@@ -137,14 +166,14 @@ class DanbooruDownloaderPlugin(Star):
                     yield event.plain_result("下载图片失败")
                     return
                 
-                # 发送图片（使用旧版API的方式）
+                # 发送图片
                 yield event.image_result(local_path)
                 
         except Exception as e:
             logger.error(f"发送美图失败: {e}")
             yield event.plain_result(f"发送失败: {str(e)}")
         finally:
-            # 确保无论如何都清理临时文件
+            # 清理临时文件
             if local_path and os.path.exists(local_path):
                 try:
                     os.remove(local_path)
