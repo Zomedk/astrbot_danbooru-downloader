@@ -2,12 +2,21 @@
   "conf_schema": [
     {
       "type": "section",
-      "title": "环境变量配置",
+      "title": "Danbooru API 配置",
       "children": [
         {
-          "type": "html",
-          "name": "env_notice",
-          "content": "<div style='background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:10px;margin-bottom:10px;'><strong>⚠️ 重要提示</strong><br/>请在系统环境变量或 .env 文件中设置以下变量：<br/><code>DANBOORU_USERNAME</code> - Danbooru用户名<br/><code>DANBOORU_API_KEY</code> - Danbooru API Key<br/><br/>获取方式：登录 Danbooru → Profile → API Key</div>"
+          "type": "text",
+          "name": "username",
+          "label": "Danbooru 用户名",
+          "required": true,
+          "placeholder": "输入你的Danbooru用户名"
+        },
+        {
+          "type": "password",
+          "name": "api_key",
+          "label": "API Key",
+          "required": true,
+          "placeholder": "输入你的Danbooru API Key"
         }
       ]
     },

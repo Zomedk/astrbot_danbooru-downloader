@@ -6,10 +6,6 @@ from astrbot.api.logger import Logger
 
 PLUGIN_NAME = "astrbot_danbooru_downloader"
 
-# 从环境变量读取 Danbooru API 配置
-USERNAME = os.getenv("DANBOORU_USERNAME", "")
-API_KEY = os.getenv("DANBOORU_API_KEY", "")
-
 class DanbooruDownloaderPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -82,13 +78,17 @@ class DanbooruDownloaderPlugin(Star):
         if self.download_status["is_running"]:
             return {"success": False, "message": "下载已在运行中"}
         
-        # 使用环境变量中的 API 配置
-        if not USERNAME or not API_KEY:
-            return {"success": False, "message": "请先配置环境变量 DANBOORU_USERNAME 和 DANBOORU_API_KEY"}
+        # 从AstrBot插件配置中读取API凭证
+        config = self.context.plugin_config.get("config", {})
+        username = config.get("username", "")
+        api_key = config.get("api_key", "")
+        
+        if not username or not api_key:
+            return {"success": False, "message": "请先在插件配置中填写用户名和API Key"}
         
         # 启动后台下载任务
         import asyncio
-        asyncio.create_task(self._download_task(USERNAME, API_KEY, self.context.plugin_config.get("config", {})))
+        asyncio.create_task(self._download_task(username, api_key, config))
         
         return {"success": True, "message": "下载任务已启动"}
     
