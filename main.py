@@ -48,57 +48,6 @@ class DanbooruDownloaderPlugin(Star):
             "downloaded": 0,
             "errors": []
         }
-        
-        self._register_commands()
-    
-    def _register_commands(self):
-        @self.on_message(filter.keywords("danbooru下载"))
-        async def handle_download_command(event: AstrMessageEvent):
-            args = event.message.content.strip().split()
-            if len(args) < 2:
-                await event.reply(Plain("用法：danbooru下载 <角色名> [数量]\n例如：danbooru下载 管理员 50"))
-                return
-            
-            char_name = args[1]
-            count = int(args[2]) if len(args) > 2 else 50
-            
-            if char_name not in CHARACTERS_MAP:
-                chars = "\n".join(CHARACTERS_MAP.keys())
-                await event.reply(Plain(f"未知角色！支持的角色：\n{chars}"))
-                return
-            
-            if self.download_status["is_running"]:
-                await event.reply(Plain("下载任务正在进行中，请稍后再试"))
-                return
-            
-            config = self.context.plugin_config.get("config", {})
-            username = config.get("username", "")
-            api_key = config.get("api_key", "")
-            
-            if not username or not api_key:
-                await event.reply(Plain("请先在插件配置中填写Danbooru用户名和API Key"))
-                return
-            
-            await event.reply(Plain(f"开始下载角色 [{char_name}] 的图片，目标数量：{count}"))
-            asyncio.create_task(self._download_single_character(username, api_key, char_name, count, event))
-        
-        @self.on_message(filter.keywords("danbooru状态"))
-        async def handle_status_command(event: AstrMessageEvent):
-            if self.download_status["is_running"]:
-                msg = f"正在下载: {self.download_status['current_char']}\n"
-                msg += f"进度: {self.download_status['progress']}%\n"
-                msg += f"已下载: {self.download_status['downloaded']} 张"
-            else:
-                if self.download_status["total"] > 0:
-                    msg = f"上次下载完成！共 {self.download_status['total']} 张图片"
-                else:
-                    msg = "当前无下载任务"
-            await event.reply(Plain(msg))
-        
-        @self.on_message(filter.keywords("danbooru角色"))
-        async def handle_characters_command(event: AstrMessageEvent):
-            chars = "\n".join(CHARACTERS_MAP.keys())
-            await event.reply(Plain(f"支持的角色列表：\n{chars}"))
     
     def _clean_filename(self, filename: str) -> str:
         invalid_chars = r'[\\/:*?"<>|]'
@@ -150,7 +99,7 @@ class DanbooruDownloaderPlugin(Star):
             logger.error(f"下载图片时发生异常: {e}")
             return False
     
-    async def _download_single_character(self, username: str, api_key: str, char_name: str, count: int, event: AstrMessageEvent):
+    async def _download_single_character(self, username: str, api_key: str, char_name: str, count: int) -> str:
         self.download_status["is_running"] = True
         self.download_status["current_char"] = char_name
         
@@ -171,13 +120,10 @@ class DanbooruDownloaderPlugin(Star):
                             break
                 
                 if not image_posts:
-                    await event.reply(Plain(f"未找到角色 [{char_name}] 的图片"))
-                    return
+                    return f"未找到角色 [{char_name}] 的图片"
                 
                 downloaded = 0
                 total = len(image_posts)
-                
-                await event.reply(Plain(f"找到 {total} 张图片，开始下载..."))
                 
                 for i, post in enumerate(image_posts, 1):
                     file_url = post['file_url']
@@ -192,12 +138,66 @@ class DanbooruDownloaderPlugin(Star):
                     self.download_status["progress"] = int((i / total) * 100)
                     self.download_status["downloaded"] = downloaded
                 
-                await event.reply(Plain(f"角色 [{char_name}] 下载完成！\n成功下载: {downloaded}/{total} 张\n保存位置: {char_dir}"))
+                return f"角色 [{char_name}] 下载完成！\n成功下载: {downloaded}/{total} 张\n保存位置: {char_dir}"
         
         except Exception as e:
-            await event.reply(Plain(f"下载失败: {str(e)}"))
             logger.error(f"下载角色 [{char_name}] 时出错: {e}")
+            return f"下载失败: {str(e)}"
         
         finally:
             self.download_status["is_running"] = False
             self.download_status["current_char"] = ""
+    
+    @filter.command("danbooru下载")
+    async def handle_download_command(self, event: AstrMessageEvent):
+        args = event.message_str.replace("danbooru下载", "", 1).strip().split()
+        
+        if not args:
+            yield event.plain_result("用法：danbooru下载 <角色名> [数量]\n例如：danbooru下载 管理员 50")
+            return
+        
+        char_name = args[0]
+        count = int(args[1]) if len(args) > 1 else 50
+        
+        if char_name not in CHARACTERS_MAP:
+            chars = "\n".join(CHARACTERS_MAP.keys())
+            yield event.plain_result(f"未知角色！支持的角色：\n{chars}")
+            return
+        
+        if self.download_status["is_running"]:
+            yield event.plain_result("下载任务正在进行中，请稍后再试")
+            return
+        
+        config = self.context.plugin_config.get("config", {})
+        username = config.get("username", "")
+        api_key = config.get("api_key", "")
+        
+        if not username or not api_key:
+            yield event.plain_result("请先在插件配置中填写Danbooru用户名和API Key")
+            return
+        
+        yield event.plain_result(f"开始下载角色 [{char_name}] 的图片，目标数量：{count}")
+        
+        result = await self._download_single_character(username, api_key, char_name, count)
+        yield event.plain_result(result)
+    
+    @filter.command("danbooru状态")
+    async def handle_status_command(self, event: AstrMessageEvent):
+        if self.download_status["is_running"]:
+            msg = f"正在下载: {self.download_status['current_char']}\n"
+            msg += f"进度: {self.download_status['progress']}%\n"
+            msg += f"已下载: {self.download_status['downloaded']} 张"
+        else:
+            if self.download_status["total"] > 0:
+                msg = f"上次下载完成！共 {self.download_status['total']} 张图片"
+            else:
+                msg = "当前无下载任务"
+        yield event.plain_result(msg)
+    
+    @filter.command("danbooru角色")
+    async def handle_characters_command(self, event: AstrMessageEvent):
+        chars = "\n".join(CHARACTERS_MAP.keys())
+        yield event.plain_result(f"支持的角色列表：\n{chars}")
+    
+    async def terminate(self):
+        pass
