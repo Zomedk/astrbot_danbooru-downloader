@@ -1,0 +1,12 @@
+{
+    "username": {
+        "description": "Danbooru 用户名",
+        "type": "string",
+        "hint": "填写你在 danbooru.donmai.us 的用户名"
+    },
+    "api_key": {
+        "description": "Danbooru API Key",
+        "type": "string",
+        "hint": "在 Danbooru 账户设置中获取"
+    }
+}
