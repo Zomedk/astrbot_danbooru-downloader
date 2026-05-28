@@ -6,8 +6,10 @@ from pathlib import Path
 from typing import Dict, List
 
 import aiohttp
-from astrbot.core import AstrBotPlugin, CommandEvent, MessageEvent, logger
-from astrbot.core.message.component import Image, Plain
+from astrbot.api import logger
+from astrbot.api.star import Context, Star, register
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.message_components import Plain, Image
 
 
 CHARACTERS_MAP = {
@@ -30,17 +32,13 @@ CHARACTERS_MAP = {
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
 
 
-class DanbooruDownloaderPlugin(AstrBotPlugin):
-    def __init__(self, context, config):
-        super().__init__(context, config)
+@register("astrbot_danbooru_downloader", "Zomedk", "Danbooru美图插件", "1.0.0")
+class DanbooruDownloaderPlugin(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
         self.plugin_dir = Path(__file__).parent
         self.temp_dir = self.plugin_dir / "temp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-        self._register_commands()
-    
-    def _clean_filename(self, filename: str) -> str:
-        invalid_chars = r'[\\/:*?"<>|]'
-        return re.sub(invalid_chars, '_', filename)
     
     async def _fetch_random_image(self, session: aiohttp.ClientSession, username: str, api_key: str, tag: str) -> str:
         url = "https://danbooru.donmai.us/posts.json"
@@ -93,61 +91,60 @@ class DanbooruDownloaderPlugin(AstrBotPlugin):
         except Exception as e:
             logger.error(f"下载图片失败: {e}")
             return ""
-    
-    def _register_commands(self):
-        @self.command("美图")
-        async def handle_meitu_command(event: CommandEvent):
-            # 获取命令参数（移除 /美图 部分）
-            args = event.message_str.split()
-            char_name = args[1] if len(args) > 1 else ""
-            
-            if not char_name:
-                chars = "\n".join(CHARACTERS_MAP.keys())
-                yield event.reply(f"请指定角色名！\n用法：/美图 <角色名>\n支持的角色：\n{chars}")
-                return
-            
-            if char_name not in CHARACTERS_MAP:
-                chars = "\n".join(CHARACTERS_MAP.keys())
-                yield event.reply(f"未知角色！支持的角色：\n{chars}")
-                return
-            
-            # 获取配置（注意：v4.14.6 的配置获取方式）
-            username = self.get_config().get("username", "")
-            api_key = self.get_config().get("api_key", "")
-            
-            if not username or not api_key:
-                yield event.reply("请先在插件配置中填写Danbooru用户名和API Key")
-                return
-            
-            yield event.reply(f"正在获取 [{char_name}] 的美图...")
-            
-            try:
-                async with aiohttp.ClientSession() as session:
-                    image_url = await self._fetch_random_image(session, username, api_key, CHARACTERS_MAP[char_name])
-                    
-                    if not image_url:
-                        yield event.reply(f"未找到角色 [{char_name}] 的图片")
-                        return
-                    
-                    local_path = await self._download_image(session, image_url)
-                    
-                    if not local_path:
-                        yield event.reply("下载图片失败")
-                        return
-                    
-                    # 发送图片
-                    yield event.image_result(local_path)
-                    
-                    os.remove(local_path)
-                    
-            except Exception as e:
-                logger.error(f"发送美图失败: {e}")
-                yield event.reply(f"发送失败: {str(e)}")
+
+    @filter.command("美图")
+    async def handle_meitu_command(self, event: AstrMessageEvent):
+        # 获取命令参数
+        char_name = event.message_str.replace("美图", "", 1).strip()
         
-        @self.command("美图角色")
-        async def handle_characters_command(event: CommandEvent):
+        if not char_name:
             chars = "\n".join(CHARACTERS_MAP.keys())
-            yield event.reply(f"支持的角色列表：\n{chars}")
+            yield event.plain_result(f"请指定角色名！\n用法：美图 <角色名>\n支持的角色：\n{chars}")
+            return
+        
+        if char_name not in CHARACTERS_MAP:
+            chars = "\n".join(CHARACTERS_MAP.keys())
+            yield event.plain_result(f"未知角色！支持的角色：\n{chars}")
+            return
+        
+        # 获取配置（与赛尔号插件相同的方式）
+        username = self.context.plugin_config.get("username", "") if hasattr(self.context, 'plugin_config') else ""
+        api_key = self.context.plugin_config.get("api_key", "") if hasattr(self.context, 'plugin_config') else ""
+        
+        if not username or not api_key:
+            yield event.plain_result("请先在插件配置中填写Danbooru用户名和API Key")
+            return
+        
+        yield event.plain_result(f"正在获取 [{char_name}] 的美图...")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                image_url = await self._fetch_random_image(session, username, api_key, CHARACTERS_MAP[char_name])
+                
+                if not image_url:
+                    yield event.plain_result(f"未找到角色 [{char_name}] 的图片")
+                    return
+                
+                local_path = await self._download_image(session, image_url)
+                
+                if not local_path:
+                    yield event.plain_result("下载图片失败")
+                    return
+                
+                # 发送图片（使用旧版API的方式）
+                yield event.image_result(local_path)
+                
+                # 清理临时文件
+                os.remove(local_path)
+                
+        except Exception as e:
+            logger.error(f"发送美图失败: {e}")
+            yield event.plain_result(f"发送失败: {str(e)}")
     
-    async def on_ready(self):
-        logger.info("Danbooru美图插件已启动")
+    @filter.command("美图角色")
+    async def handle_characters_command(self, event: AstrMessageEvent):
+        chars = "\n".join(CHARACTERS_MAP.keys())
+        yield event.plain_result(f"支持的角色列表：\n{chars}")
+    
+    async def terminate(self):
+        pass
