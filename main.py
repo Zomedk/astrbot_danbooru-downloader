@@ -8,7 +8,8 @@ from typing import Dict, List, Optional
 import aiohttp
 from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
-from astrbot.api.web import WebPage
+from astrbot.api.message_components import Plain
+from astrbot.api.event import filter, AstrMessageEvent
 
 
 CHARACTERS_MAP = {
@@ -48,16 +49,56 @@ class DanbooruDownloaderPlugin(Star):
             "errors": []
         }
         
-        self._register_pages()
+        self._register_commands()
     
-    def _register_pages(self):
-        page = WebPage(
-            name="danbooru_downloader",
-            title="Danbooru图片下载器",
-            path="/danbooru-downloader",
-            template=self.plugin_dir / "pages" / "index.html"
-        )
-        self.context.web.register_page(page)
+    def _register_commands(self):
+        @self.on_message(filter.keywords("danbooru下载"))
+        async def handle_download_command(event: AstrMessageEvent):
+            args = event.message.content.strip().split()
+            if len(args) < 2:
+                await event.reply(Plain("用法：danbooru下载 <角色名> [数量]\n例如：danbooru下载 管理员 50"))
+                return
+            
+            char_name = args[1]
+            count = int(args[2]) if len(args) > 2 else 50
+            
+            if char_name not in CHARACTERS_MAP:
+                chars = "\n".join(CHARACTERS_MAP.keys())
+                await event.reply(Plain(f"未知角色！支持的角色：\n{chars}"))
+                return
+            
+            if self.download_status["is_running"]:
+                await event.reply(Plain("下载任务正在进行中，请稍后再试"))
+                return
+            
+            config = self.context.plugin_config.get("config", {})
+            username = config.get("username", "")
+            api_key = config.get("api_key", "")
+            
+            if not username or not api_key:
+                await event.reply(Plain("请先在插件配置中填写Danbooru用户名和API Key"))
+                return
+            
+            await event.reply(Plain(f"开始下载角色 [{char_name}] 的图片，目标数量：{count}"))
+            asyncio.create_task(self._download_single_character(username, api_key, char_name, count, event))
+        
+        @self.on_message(filter.keywords("danbooru状态"))
+        async def handle_status_command(event: AstrMessageEvent):
+            if self.download_status["is_running"]:
+                msg = f"正在下载: {self.download_status['current_char']}\n"
+                msg += f"进度: {self.download_status['progress']}%\n"
+                msg += f"已下载: {self.download_status['downloaded']} 张"
+            else:
+                if self.download_status["total"] > 0:
+                    msg = f"上次下载完成！共 {self.download_status['total']} 张图片"
+                else:
+                    msg = "当前无下载任务"
+            await event.reply(Plain(msg))
+        
+        @self.on_message(filter.keywords("danbooru角色"))
+        async def handle_characters_command(event: AstrMessageEvent):
+            chars = "\n".join(CHARACTERS_MAP.keys())
+            await event.reply(Plain(f"支持的角色列表：\n{chars}"))
     
     def _clean_filename(self, filename: str) -> str:
         invalid_chars = r'[\\/:*?"<>|]'
@@ -109,101 +150,54 @@ class DanbooruDownloaderPlugin(Star):
             logger.error(f"下载图片时发生异常: {e}")
             return False
     
-    async def _download_character_images(self, session: aiohttp.ClientSession, username: str, api_key: str, 
-                                         char_name: str, char_tag: str, target_count: int) -> int:
-        logger.info(f"开始获取角色 [{char_name}] 的图片")
+    async def _download_single_character(self, username: str, api_key: str, char_name: str, count: int, event: AstrMessageEvent):
+        self.download_status["is_running"] = True
+        self.download_status["current_char"] = char_name
         
-        posts = await self._fetch_posts(session, username, api_key, char_tag, target_count * 2)
-        
-        image_posts = []
-        for post in posts:
-            file_url = post.get('file_url')
-            if file_url and file_url.lower().endswith(IMAGE_EXTENSIONS):
-                image_posts.append(post)
-                if len(image_posts) >= target_count:
-                    break
-        
-        if not image_posts:
-            logger.info(f"未找到 [{char_name}] 的图片")
-            return 0
-        
+        char_tag = CHARACTERS_MAP[char_name]
         char_dir = self.download_dir / char_name
         char_dir.mkdir(parents=True, exist_ok=True)
         
-        downloaded = 0
-        tasks = []
-        
-        for i, post in enumerate(image_posts, 1):
-            file_url = post['file_url']
-            ext = Path(file_url).suffix
-            filename = f"{i:02d}_收藏{post.get('fav_count', 0)}_ID{post['id']}{ext}"
-            filename = self._clean_filename(filename)
-            save_path = char_dir / filename
-            
-            tasks.append(self._download_image(session, file_url, save_path))
-            
-            if len(tasks) >= 5 or i == len(image_posts):
-                results = await asyncio.gather(*tasks)
-                downloaded += sum(results)
-                tasks = []
+        try:
+            async with aiohttp.ClientSession() as session:
+                posts = await self._fetch_posts(session, username, api_key, char_tag, count * 2)
                 
-                self.download_status["progress"] = int((i / len(image_posts)) * 100)
-                self.download_status["downloaded"] = downloaded
+                image_posts = []
+                for post in posts:
+                    file_url = post.get('file_url')
+                    if file_url and file_url.lower().endswith(IMAGE_EXTENSIONS):
+                        image_posts.append(post)
+                        if len(image_posts) >= count:
+                            break
                 
-                await asyncio.sleep(0.5)
-        
-        logger.info(f"角色 [{char_name}] 下载完成，共 {downloaded} 张")
-        return downloaded
-    
-    async def _download_task(self, username: str, api_key: str, config: Dict):
-        self.download_status["is_running"] = True
-        self.download_status["errors"] = []
-        
-        max_workers = config.get("max_workers", 10)
-        target_count = config.get("target_count", 50)
-        
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=max_workers)) as session:
-            total_downloaded = 0
-            
-            for char_name, char_tag in CHARACTERS_MAP.items():
-                self.download_status["current_char"] = char_name
-                self.download_status["progress"] = 0
-                self.download_status["downloaded"] = 0
+                if not image_posts:
+                    await event.reply(Plain(f"未找到角色 [{char_name}] 的图片"))
+                    return
                 
-                try:
-                    downloaded = await self._download_character_images(session, username, api_key, 
-                                                                       char_name, char_tag, target_count)
-                    total_downloaded += downloaded
-                except Exception as e:
-                    logger.error(f"下载角色 [{char_name}] 时出错: {e}")
-                    self.download_status["errors"].append(f"{char_name}: {str(e)}")
+                downloaded = 0
+                total = len(image_posts)
                 
-                await asyncio.sleep(1)
+                await event.reply(Plain(f"找到 {total} 张图片，开始下载..."))
+                
+                for i, post in enumerate(image_posts, 1):
+                    file_url = post['file_url']
+                    ext = Path(file_url).suffix
+                    filename = f"{i:02d}_收藏{post.get('fav_count', 0)}_ID{post['id']}{ext}"
+                    filename = self._clean_filename(filename)
+                    save_path = char_dir / filename
+                    
+                    if await self._download_image(session, file_url, save_path):
+                        downloaded += 1
+                    
+                    self.download_status["progress"] = int((i / total) * 100)
+                    self.download_status["downloaded"] = downloaded
+                
+                await event.reply(Plain(f"角色 [{char_name}] 下载完成！\n成功下载: {downloaded}/{total} 张\n保存位置: {char_dir}"))
         
-        self.download_status["is_running"] = False
-        self.download_status["current_char"] = ""
-        self.download_status["total"] = total_downloaded
+        except Exception as e:
+            await event.reply(Plain(f"下载失败: {str(e)}"))
+            logger.error(f"下载角色 [{char_name}] 时出错: {e}")
         
-        logger.info(f"全部下载完成，共 {total_downloaded} 张图片")
-    
-    def api_start_download(self, config: Dict) -> Dict:
-        """开始下载流程"""
-        if self.download_status["is_running"]:
-            return {"success": False, "message": "下载已在运行中"}
-        
-        username = config.get("username", "")
-        api_key = config.get("api_key", "")
-        
-        if not username or not api_key:
-            return {"success": False, "message": "请先配置Danbooru用户名和API Key"}
-        
-        asyncio.create_task(self._download_task(username, api_key, config))
-        return {"success": True, "message": "下载任务已启动"}
-    
-    def api_get_status(self) -> Dict:
-        """获取下载状态"""
-        return self.download_status
-    
-    def api_get_characters(self) -> List[Dict]:
-        """获取支持的角色列表"""
-        return [{"name": name, "tag": tag} for name, tag in CHARACTERS_MAP.items()]
+        finally:
+            self.download_status["is_running"] = False
+            self.download_status["current_char"] = ""
