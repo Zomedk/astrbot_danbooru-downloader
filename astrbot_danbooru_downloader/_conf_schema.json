@@ -2,21 +2,12 @@
   "conf_schema": [
     {
       "type": "section",
-      "title": "Danbooru API配置",
+      "title": "环境变量配置",
       "children": [
         {
-          "type": "text",
-          "name": "username",
-          "label": "用户名",
-          "required": true,
-          "placeholder": "Danbooru用户名"
-        },
-        {
-          "type": "password",
-          "name": "api_key",
-          "label": "API Key",
-          "required": true,
-          "placeholder": "Danbooru API Key"
+          "type": "html",
+          "name": "env_notice",
+          "content": "<div style='background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:10px;margin-bottom:10px;'><strong>⚠️ 重要提示</strong><br/>请在系统环境变量或 .env 文件中设置以下变量：<br/><code>DANBOORU_USERNAME</code> - Danbooru用户名<br/><code>DANBOORU_API_KEY</code> - Danbooru API Key<br/><br/>获取方式：登录 Danbooru → Profile → API Key</div>"
         }
       ]
     },
@@ -39,19 +30,6 @@
           "default": 50,
           "min": 10,
           "max": 200
-        }
-      ]
-    },
-    {
-      "type": "section",
-      "title": "角色列表",
-      "children": [
-        {
-          "type": "textarea",
-          "name": "characters",
-          "label": "角色列表（JSON格式）",
-          "default": "[\"拉姆\", \"雷姆\", \"胡桃\"]",
-          "placeholder": "JSON数组，格式: [\"角色1\", \"角色2\"]"
         }
       ]
     }

@@ -3,10 +3,17 @@ import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
+from dotenv import load_dotenv
 
-# 1. Danbooru API 认证信息
-USERNAME = "TBML_kmd"
-API_KEY = "Jxt2VuyBxaiCpQScbpbAkotH"
+# 加载 .env 文件
+load_dotenv()
+
+# 1. Danbooru API 认证信息（从环境变量读取）
+USERNAME = os.getenv("DANBOORU_USERNAME", "")
+API_KEY = os.getenv("DANBOORU_API_KEY", "")
+
+if not USERNAME or not API_KEY:
+    raise ValueError("请设置环境变量 DANBOORU_USERNAME 和 DANBOORU_API_KEY")
 
 # 2. 热门二次元角色映射表（Danbooru官方标签）
 CHARACTERS_MAP = [
