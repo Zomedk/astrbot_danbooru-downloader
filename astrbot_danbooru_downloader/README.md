@@ -1,76 +1,45 @@
-# AstrBot Danbooru 图片下载器插件
+# AstrBot Danbooru图片下载器插件
+
+一个用于下载Danbooru图片的AstrBot插件，支持热门二次元角色图片下载。
+
+## 功能特性
+
+- 🎭 支持14个热门二次元角色
+- 📦 自动按角色创建文件夹
+- ⚡ 异步并发下载，速度更快
+- 🖼️ 只下载图片文件（过滤视频）
+- 📊 实时下载进度显示
+- 🎨 美观的Web界面
+
+## 支持的角色
+
+- 明日方舟：管理员、佩丽卡、艾尔黛拉、陈千语
+- 原神：胡桃、雷电将军、神里绫华
+- Re:Zero：拉姆、雷姆
+- 电锯人：玛奇玛、帕瓦
+- 其他：02、阿尼亚、约尔
 
 ## 安装方法
 
-1. 将整个 `astrbot_danbooru_downloader` 文件夹复制到 AstrBot 的插件目录
-2. 在 AstrBot WebUI 中启用插件
-3. 配置你的 Danbooru 用户名和 API Key
+1. 在AstrBot插件管理页面上传插件压缩包
+2. 配置Danbooru用户名和API Key
+3. 在插件页面点击开始下载
 
-## 获取 Danbooru API Key
+## 配置说明
 
-1. 登录 Danbooru 账号
-2. 进入 Profile 设置页面
-3. 找到 "API Key" 部分，点击生成
-4. 复制生成的 API Key
+在插件配置页面填写：
+- **Danbooru用户名**：你的Danbooru账户用户名
+- **API Key**：在Danbooru账户设置中生成的API Key
 
-## 使用方法
+## 使用说明
 
-1. 在插件配置中填入 Danbooru 用户名和 API Key
-2. 在插件页面中选择要下载的角色
-3. 设置下载数量和并发数
-4. 点击"开始下载"
-5. 下载完成后，在 `data/plugins/astrbot_danbooru_downloader/downloads` 目录查看图片
-
-## 功能特点
-
-- ✅ 支持选择多个角色批量下载
-- ✅ 并发下载加速
-- ✅ 实时显示下载进度
-- ✅ 自动过滤非图片文件
-- ✅ 只下载全年龄内容（rating:g）
-- ✅ 错误处理和日志记录
-
-## 角色列表
-
-插件内置了以下角色的标签映射：
-
-### Re:Zero
-- 拉姆 (rem)
-- 雷姆 (ram)
-
-### 原神
-- 胡桃 (hutao)
-- 雷电将军 (raiden_shogun)
-- 神里绫华 (kamisato_ayaka)
-
-### 电锯人
-- 玛奇玛 (makima)
-- 帕瓦 (power)
-
-### 其他热门角色
-- 02 (Darling in the Franxx)
-- 阿尼亚 (间谍过家家)
-- 约尔 (间谍过家家)
-
-### 明日方舟：终末地
-- 管理员
-- 艾尔黛拉
-- 佩丽卡
-- 陈千语
-
-## 文件结构
-
-```
-astrbot_danbooru_downloader/
-├── main.py                      # 插件主文件
-├── _conf_schema.json           # 配置界面定义
-└── pages/
-    └── danbooru-downloader/
-        └── index.html          # 插件Web界面
-```
+1. 进入插件页面
+2. 设置下载数量和并发数
+3. 点击"开始下载"按钮
+4. 等待下载完成
 
 ## 注意事项
 
-- 请勿在公共场合泄露你的 API Key
-- Danbooru 有 API 访问频率限制，请合理设置并发数
-- 下载的图片仅供个人学习使用，请遵守版权规定
+- 请确保你的Danbooru账户有足够的权限
+- 建议使用等级较高的账户以获得更好的API访问权限
+- 下载的图片将保存在插件目录的downloads文件夹中
