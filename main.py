@@ -41,16 +41,18 @@ class DanbooruDownloaderPlugin(Star):
         self.plugin_dir = Path(__file__).parent
         self.temp_dir = self.plugin_dir / "temp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # 保存配置
         self.config = config if config else {}
-        
+
         # 读取配置
         self.username = self.config.get("username", "")
         self.api_key = self.config.get("api_key", "")
-        # 发送方式：direct=直接发送，forward=转发消息（更安全）
         self.send_mode = self.config.get("send_mode", "forward")
-        
+
+        # ⭐新增：代理配置
+        self.proxy = self.config.get("proxy", "").strip()
+
         if self.username:
             logger.info(f"Danbooru插件配置加载成功: username={self.username}, send_mode={self.send_mode}")
         else:
@@ -86,7 +88,8 @@ class DanbooruDownloaderPlugin(Star):
                 params=params, 
                 headers=headers, 
                 auth=auth, 
-                timeout=30
+                timeout=30,
+                proxy=self.proxy if self.proxy else None
             ) as response:
                 logger.info(f"[DEBUG] API 响应状态码: {response.status}")
                 
@@ -157,7 +160,7 @@ class DanbooruDownloaderPlugin(Star):
                 "Connection": "keep-alive",
             }
             
-            async with session.get(url, headers=headers, timeout=60) as response:
+            async with session.get(url, headers=headers, timeout=60, proxy=self.proxy if self.proxy else None) as response:
                 logger.info(f"[DEBUG] 下载响应状态码: {response.status}")
                 
                 if response.status != 200:
