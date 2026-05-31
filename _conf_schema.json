@@ -1,0 +1,27 @@
+{
+    "username": {
+        "description": "Danbooru 用户名",
+        "type": "string",
+        "hint": "填写你在 danbooru.donmai.us 的用户名",
+        "default": ""
+    },
+    "api_key": {
+        "description": "Danbooru API Key",
+        "type": "string",
+        "hint": "在 Danbooru 账户设置中获取",
+        "default": ""
+    },
+    "send_mode": {
+        "description": "发送方式",
+        "type": "string",
+        "hint": "direct=直接发送, forward=转发消息(更安全)",
+        "default": "forward",
+        "options": ["direct", "forward"]
+    },
+    "proxy": {
+        "description": "HTTP代理（mihomo / clash 本地端口）",
+        "type": "string",
+        "hint": "例如 http://127.0.0.1:7890",
+        "default": ""
+    }
+}

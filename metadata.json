@@ -1,0 +1,6 @@
+{
+    "name": "astrbot_danbooru_downloader",
+    "author": "Zomedk",
+    "version": "1.0.0",
+    "description": "Danbooru美图插件，支持获取热门二次元角色随机图片"
+}
