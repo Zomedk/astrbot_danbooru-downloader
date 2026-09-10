@@ -95,12 +95,11 @@ class DanbooruDownloaderPlugin(Star):
             tag_parts.append(RATING_MAP[rating])
         if filtered:
             tag_parts.append("score:>30")
-        tag_parts.append(f"order:{order}")
         tags = " ".join(tag_parts)
         limit = max(1, min(int(limit), MAX_API_LIMIT))
         
         try:
-            resp = self.session.get(BASE_URL, params={"tags": tags, "limit": limit},
+            resp = self.session.get(BASE_URL, params={"tags": tags, "limit": limit, "order": order},
                                    auth=(self.username, self.api_key),
                                    proxies=self._get_proxy_dict(), timeout=15)
             if resp.status_code != 200:
@@ -114,7 +113,7 @@ class DanbooruDownloaderPlugin(Star):
                 and (p.get("file_url") or p.get("large_file_url"))
             ]
             logger.info(f"[Danbooru] 获取到 {len(candidates)} 张图片" + (" (筛选模式)" if filtered else ""))
-            return random.choice(candidates) if candidates else None
+            return candidates
         except Exception as e:
             logger.error(f"[Danbooru] API错误: {e}")
             return None
