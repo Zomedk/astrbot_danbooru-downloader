@@ -23,5 +23,11 @@
         "type": "string",
         "hint": "例如 http://127.0.0.1:7890",
         "default": ""
+    },
+    "new_limit": {
+        "description": "新图候选数量",
+        "type": "int",
+        "hint": "按最新排序获取一批图片后随机选择，范围 1-200",
+        "default": 100
     }
 }

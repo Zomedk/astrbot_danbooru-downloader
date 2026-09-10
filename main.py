@@ -1,4 +1,5 @@
 import os, random, io, asyncio, uuid
+from collections import deque
 from PIL import Image as PILImage
 from pathlib import Path
 from typing import Tuple
@@ -14,12 +15,22 @@ BASE_URL = "https://danbooru.donmai.us/posts.json"
 RATING_MAP = {"all": "rating:g~rating:q", "safe": "rating:g", "r18": "rating:e"}
 
 R18_COOLDOWN = 30
+DEFAULT_NEW_LIMIT = 100
+MAX_API_LIMIT = 200
+RECENT_HISTORY = 3
+MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
 
 async def delay_delete_file(file_path: str, delay: int = 60):
-    await asyncio.sleep(delay)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        logger.info(f"[Danbooru] 已删除缓存 {os.path.basename(file_path)}")
+    try:
+        await asyncio.sleep(delay)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info(f"[Danbooru] 已删除缓存 {os.path.basename(file_path)}")
+    except asyncio.CancelledError:
+        raise
+    except OSError as e:
+        logger.warning(f"[Danbooru] 删除缓存失败 {os.path.basename(file_path)}: {e}")
 
 @register("astrbot_danbooru_downloader", "Zomedk", "Danbooru美图插件", "3.7.0")
 class DanbooruDownloaderPlugin(Star):
@@ -31,6 +42,14 @@ class DanbooruDownloaderPlugin(Star):
         self.proxy = self.config.get("proxy")
         self.is_sending = False
         self.last_r18_time = 0
+        self.recent_post_ids = {}
+        try:
+            self.new_limit = max(
+                1,
+                min(int(self.config.get("new_limit", DEFAULT_NEW_LIMIT)), MAX_API_LIMIT),
+            )
+        except (TypeError, ValueError):
+            self.new_limit = DEFAULT_NEW_LIMIT
         
         import requests
         self.session = requests.Session()
@@ -70,45 +89,81 @@ class DanbooruDownloaderPlugin(Star):
                 rating = "safe"
         return name, rating, solo, filtered
 
-    def _fetch_image(self, tag: str, rating: str, order: str, limit: int, filtered: bool = False) -> str:
-        tags = f"{tag} {RATING_MAP.get(rating, '')}" if rating != "all" else tag
+    def _fetch_image(self, tag: str, rating: str, order: str, limit: int, filtered: bool = False) -> dict | None:
+        tag_parts = [tag]
+        if rating != "all" and RATING_MAP.get(rating):
+            tag_parts.append(RATING_MAP[rating])
         if filtered:
-            tags = f"{tags} score:>30"
+            tag_parts.append("score:>30")
+        tag_parts.append(f"order:{order}")
+        tags = " ".join(tag_parts)
+        limit = max(1, min(int(limit), MAX_API_LIMIT))
         
         try:
-            resp = self.session.get(BASE_URL, params={"tags": tags, "limit": limit, "order": order},
+            resp = self.session.get(BASE_URL, params={"tags": tags, "limit": limit},
                                    auth=(self.username, self.api_key),
                                    proxies=self._get_proxy_dict(), timeout=15)
             if resp.status_code != 200:
-                return ""
+                logger.warning(f"[Danbooru] 查询失败，HTTP {resp.status_code}")
+                return None
             posts = resp.json()
-            urls = [p.get("file_url") or p.get("large_file_url") for p in posts if p.get("file_url") or p.get("large_file_url")]
-            logger.info(f"[Danbooru] 获取到 {len(urls)} 张图片" + (" (筛选模式)" if filtered else ""))
-            return random.choice(urls) if urls else ""
+            candidates = [
+                p for p in posts
+                if isinstance(p, dict)
+                and p.get("id") is not None
+                and (p.get("file_url") or p.get("large_file_url"))
+            ]
+            logger.info(f"[Danbooru] 获取到 {len(candidates)} 张图片" + (" (筛选模式)" if filtered else ""))
+            return random.choice(candidates) if candidates else None
         except Exception as e:
             logger.error(f"[Danbooru] API错误: {e}")
-            return ""
+            return None
 
     def _download(self, url: str) -> bytes:
         try:
             resp = self.session.get(url, auth=(self.username, self.api_key),
                                    proxies=self._get_proxy_dict(), timeout=15)
-            return resp.content if resp.status_code == 200 else b""
-        except:
+            if resp.status_code != 200:
+                logger.warning(f"[Danbooru] 图片下载失败，HTTP {resp.status_code}")
+                return b""
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
+                logger.warning("[Danbooru] 图片超过下载大小限制，已跳过")
+                return b""
+            content = resp.content
+            if len(content) > MAX_DOWNLOAD_BYTES:
+                logger.warning("[Danbooru] 图片超过下载大小限制，已跳过")
+                return b""
+            return content
+        except (TypeError, ValueError):
+            logger.warning("[Danbooru] 图片响应大小字段无效")
+            return b""
+        except Exception as e:
+            logger.warning(f"[Danbooru] 图片下载异常: {e}")
             return b""
 
     def _compress(self, img_bytes: bytes) -> str:
         tmp_dir = Path("/tmp/astrbot_img")
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        file_path = tmp_dir / f"{uuid.uuid4().hex}.jpg"
+        file_path = None
         
         try:
             img = PILImage.open(io.BytesIO(img_bytes))
+            width, height = img.size
+            if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+                raise ValueError("图片像素数超过限制")
+
             if getattr(img, "is_animated", False):
+                image_format = (img.format or "").lower()
+                if image_format not in {"gif", "webp"}:
+                    raise ValueError(f"不支持的动图格式: {image_format or 'unknown'}")
+                file_path = tmp_dir / f"{uuid.uuid4().hex}.{image_format}"
                 with open(file_path, "wb") as f:
                     f.write(img_bytes)
                 return str(file_path)
             
+            file_path = tmp_dir / f"{uuid.uuid4().hex}.jpg"
+            img.load()
             if img.mode in ('RGBA', 'LA', 'P') or img.format == 'PNG':
                 img = img.convert('RGB')
             
@@ -119,15 +174,40 @@ class DanbooruDownloaderPlugin(Star):
             
             logger.info(f"[Danbooru] 压缩: {len(img_bytes)//1024}KB -> {len(buf.getvalue())//1024}KB")
         except Exception as e:
-            logger.warning(f"[Danbooru] 压缩失败: {e}, 使用原始文件")
-            with open(file_path, "wb") as f:
-                f.write(img_bytes)
+            logger.warning(f"[Danbooru] 图片处理失败: {e}")
+            if file_path and file_path.exists():
+                try:
+                    file_path.unlink()
+                except OSError:
+                    pass
+            return ""
         return str(file_path)
+
+    def _choose_post(self, posts: list[dict], query_key: str) -> dict | None:
+        if not posts:
+            return None
+
+        recent = self.recent_post_ids.setdefault(
+            query_key,
+            deque(maxlen=RECENT_HISTORY),
+        )
+        fresh = [post for post in posts if post.get("id") not in recent]
+        pool = fresh if fresh else posts
+        chosen = random.choice(pool)
+        recent.append(chosen["id"])
+        return chosen
 
     async def _send_image(self, event: AstrMessageEvent, name: str, rating: str, solo: bool, order: str, icon: str, filtered: bool = False):
         tag = self.characters_map[name]
         if solo:
             tag = f"{tag} solo"
+
+        if rating == "r18" and self.last_r18_time > 0:
+            remaining = R18_COOLDOWN - (time() - self.last_r18_time)
+            if remaining > 0:
+                wait_time = int(remaining) + 1
+                yield event.plain_result(f"⏳ R18 发送冷却中，请 {wait_time} 秒后重试")
+                return
         
         rating_display = {"all": "全随机", "r18": "R18", "safe": "全年龄"}[rating]
         filter_text = " (筛选)" if filtered else ""
@@ -137,9 +217,15 @@ class DanbooruDownloaderPlugin(Star):
             if attempt > 0:
                 logger.info(f"[Danbooru] 第 {attempt+1} 次重试...")
             
-            url = await asyncio.to_thread(self._fetch_image, tag, rating, order, 30 if order == "id" else 200, filtered)
-            if not url:
+            posts = await asyncio.to_thread(self._fetch_image, tag, rating, order, self.new_limit if order == "id_desc" else 200, filtered)
+            if not posts:
                 continue
+
+            query_key = f"{tag}|{rating}|{order}|{filtered}"
+            post = self._choose_post(posts, query_key)
+            if not post:
+                continue
+            url = post.get("file_url") or post.get("large_file_url")
             
             img_bytes = await asyncio.to_thread(self._download, url)
             if not img_bytes:
@@ -148,17 +234,11 @@ class DanbooruDownloaderPlugin(Star):
             tmp_file = ""
             try:
                 tmp_file = await asyncio.to_thread(self._compress, img_bytes)
+                if not tmp_file:
+                    continue
                 logger.info("[Danbooru] 发送中...")
                 
                 if rating == "r18":
-                    now = time()
-                    elapsed = now - self.last_r18_time
-                    if elapsed < R18_COOLDOWN and self.last_r18_time > 0:
-                        wait_time = int(R18_COOLDOWN - elapsed) + 1
-                        logger.info(f"[Danbooru] R18 冷却中，等待 {wait_time} 秒...")
-                        yield event.plain_result(f"⏳ R18 发送冷却中，请 {wait_time} 秒后重试")
-                        return
-                    
                     logger.info("[Danbooru] R18 模式，使用合并转发...")
                     
                     # 固定使用机器人自己的信息
@@ -168,14 +248,17 @@ class DanbooruDownloaderPlugin(Star):
                         content=[Plain("📸"), AstrImage(file=tmp_file)]
                     )
                     
-                    self.last_r18_time = now
-                    yield event.chain_result([node])
+                    self.last_r18_time = time()
+                    result = event.chain_result([node])
                 else:
                     chain = event.plain_result("")
                     chain.chain = [AstrImage(file=tmp_file)]
-                    yield chain
-                
-                asyncio.create_task(delay_delete_file(tmp_file, 60))
+                    result = chain
+
+                try:
+                    yield result
+                finally:
+                    asyncio.create_task(delay_delete_file(tmp_file, 60))
                 return
             except asyncio.TimeoutError:
                 logger.warning(f"[Danbooru] 发送超时")
@@ -223,7 +306,7 @@ class DanbooruDownloaderPlugin(Star):
             if name not in self.characters_map:
                 yield event.plain_result(f"角色 [{name}] 不存在")
                 return
-            async for result in self._send_image(event, name, rating, solo, "id", "🆕", filtered):
+            async for result in self._send_image(event, name, rating, solo, "id_desc", "🆕", filtered):
                 yield result
         finally:
             self.is_sending = False
