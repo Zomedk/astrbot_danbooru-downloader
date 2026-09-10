@@ -1,333 +1,229 @@
-import asyncio
-import os
-import random
-import re
-import uuid
+import os, random, io, asyncio, uuid
+from PIL import Image as PILImage
 from pathlib import Path
-from typing import Dict, List
+from typing import Tuple
+from time import time
 
-import aiohttp
 from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import Plain, Image
-from astrbot.core.message.components import Node, Nodes
+from astrbot.api.message_components import Image as AstrImage, Node, Plain
+from .mapping import RAW_DICT_GENSHIN_IMPACT
 
+BASE_URL = "https://danbooru.donmai.us/posts.json"
+RATING_MAP = {"all": "rating:g~rating:q", "safe": "rating:g", "r18": "rating:e"}
 
-CHARACTERS_MAP = {
-    "管理员": "endministrator_(arknights)",
-    "佩丽卡": "perlica_(arknights)",
-    "艾尔黛拉": "ardelia_(arknights)",
-    "陈千语": "chen_qianyu_(arknights)",
-    "胡桃": "hu_tao_(genshin_impact)",
-    "雷电将军": "raiden_shogun_(genshin_impact)",
-    "神里绫华": "kamisato_ayaka_(genshin_impact)",
-    "拉姆": "ram_(re:zero)",
-    "雷姆": "rem_(re:zero)",
-    "玛奇玛": "makima_(chainsaw_man)",
-    "帕瓦": "power_(chainsaw_man)",
-    "02": "zero_two_(darling_in_the_franxx)",
-    "阿尼亚": "anya_forger",
-    "约尔": "yor_briar",
-}
+R18_COOLDOWN = 30
 
-IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
+async def delay_delete_file(file_path: str, delay: int = 60):
+    await asyncio.sleep(delay)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        logger.info(f"[Danbooru] 已删除缓存 {os.path.basename(file_path)}")
 
-
-@register("astrbot_danbooru_downloader", "Zomedk", "Danbooru美图插件", "1.0.0")
+@register("astrbot_danbooru_downloader", "Zomedk", "Danbooru美图插件", "3.7.0")
 class DanbooruDownloaderPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        self.plugin_dir = Path(__file__).parent
-        self.temp_dir = self.plugin_dir / "temp"
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-
-        # 保存配置
-        self.config = config if config else {}
-
-        # 读取配置
-        self.username = self.config.get("username", "")
-        self.api_key = self.config.get("api_key", "")
-        self.send_mode = self.config.get("send_mode", "forward")
-
-        # ⭐新增：代理配置
-        self.proxy = self.config.get("proxy", "").strip()
-
-        if self.username:
-            logger.info(f"Danbooru插件配置加载成功: username={self.username}, send_mode={self.send_mode}")
-        else:
-            logger.warning("Danbooru插件配置未找到 username 或 api_key")
-    
-    async def _fetch_random_image(self, session: aiohttp.ClientSession, username: str, api_key: str, tag: str) -> str:
-        """从 Danbooru API 获取随机图片 URL"""
-        url = "https://danbooru.donmai.us/posts.json"
+        self.config = config or {}
+        self.username = self.config.get("username")
+        self.api_key = self.config.get("api_key")
+        self.proxy = self.config.get("proxy")
+        self.is_sending = False
+        self.last_r18_time = 0
         
-        # 使用 Basic Auth（与本地脚本一致）
-        auth = aiohttp.BasicAuth(username, api_key)
+        import requests
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": f"Danbooru/1.0 ({self.username})", "Accept": "application/json"})
         
-        params = {
-            "tags": f"{tag} rating:g",
-            "limit": 50,
-            "order": "random"
-        }
+        self.characters_map = {}
+        for keys, tag in RAW_DICT_GENSHIN_IMPACT.items():
+            for alias in keys.split("|"):
+                if alias.strip():
+                    self.characters_map[alias.strip()] = tag
         
-        # 完整的请求头，模拟浏览器
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-        }
+        # 固定机器人信息
+        self.bot_uin = 2807007579
+        self.bot_name = "艾莉丝"
         
-        logger.info(f"[DEBUG] 请求 Danbooru API: url={url}, tag={tag}, username={username}")
+        logger.info(f"[Danbooru] 已加载 {len(self.characters_map)} 个角色")
+        logger.info(f"[Danbooru] 机器人 UIN: {self.bot_uin}, 名称: {self.bot_name}")
+
+    def _get_proxy_dict(self):
+        return {"http": self.proxy, "https": self.proxy} if self.proxy else None
+
+    def _parse_args(self, args: list) -> Tuple[str, str, bool, bool]:
+        if not args:
+            return None, "all", False, False
+        name = args[0]
+        rating = "all"
+        solo = False
+        filtered = False
+        for p in args[1:]:
+            if p == "单人":
+                solo = True
+            elif p == "筛选":
+                filtered = True
+            elif p.lower() == "r18":
+                rating = "r18"
+            elif p.lower() in ["safe", "全年龄"]:
+                rating = "safe"
+        return name, rating, solo, filtered
+
+    def _fetch_image(self, tag: str, rating: str, order: str, limit: int, filtered: bool = False) -> str:
+        tags = f"{tag} {RATING_MAP.get(rating, '')}" if rating != "all" else tag
+        if filtered:
+            tags = f"{tags} score:>30"
         
         try:
-            async with session.get(
-                url, 
-                params=params, 
-                headers=headers, 
-                auth=auth, 
-                timeout=30,
-                proxy=self.proxy if self.proxy else None
-            ) as response:
-                logger.info(f"[DEBUG] API 响应状态码: {response.status}")
-                
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"[DEBUG] API请求失败: status={response.status}, response={error_text[:500]}")
-                    return ""
-                
-                data = await response.json()
-                logger.info(f"[DEBUG] API返回数据量: {len(data)} 条")
-                
-                if not data:
-                    logger.warning(f"[DEBUG] API返回空数据: tag={tag}")
-                    return ""
-                
-                # 过滤有效图片（有 file_url 且是图片格式）
-                valid_posts = []
-                for idx, post in enumerate(data):
-                    file_url = post.get('file_url')
-                    if file_url:
-                        ext = os.path.splitext(file_url.split("?")[0])[1].lower()
-                        if ext in IMAGE_EXTENSIONS:
-                            valid_posts.append(post)
-                            logger.debug(f"[DEBUG] 有效图片 #{idx+1}: {file_url}")
-                    else:
-                        logger.debug(f"[DEBUG] 跳过无 URL 的帖子: id={post.get('id')}")
-                
-                logger.info(f"[DEBUG] 有效图片数量: {len(valid_posts)}/{len(data)}")
-                
-                if not valid_posts:
-                    logger.warning(f"[DEBUG] 无有效图片: tag={tag}")
-                    return ""
-                
-                # 随机选择一张
-                selected = random.choice(valid_posts)
-                selected_url = selected.get('file_url', '')
-                logger.info(f"[DEBUG] 选中图片: {selected_url}, 收藏数: {selected.get('fav_count', 0)}, ID: {selected.get('id')}")
-                
-                return selected_url
-                
-        except asyncio.TimeoutError:
-            logger.error(f"[DEBUG] 请求超时: tag={tag}, timeout=30s")
-            return ""
-        except aiohttp.ClientResponseError as e:
-            logger.error(f"[DEBUG] HTTP 响应错误: {e.status} - {e.message}, tag={tag}")
-            return ""
-        except aiohttp.ClientConnectorError as e:
-            logger.error(f"[DEBUG] 连接错误: {e}, tag={tag}")
-            return ""
-        except aiohttp.ClientError as e:
-            logger.error(f"[DEBUG] 网络请求错误: {type(e).__name__}: {e}, tag={tag}")
-            return ""
+            resp = self.session.get(BASE_URL, params={"tags": tags, "limit": limit, "order": order},
+                                   auth=(self.username, self.api_key),
+                                   proxies=self._get_proxy_dict(), timeout=15)
+            if resp.status_code != 200:
+                return ""
+            posts = resp.json()
+            urls = [p.get("file_url") or p.get("large_file_url") for p in posts if p.get("file_url") or p.get("large_file_url")]
+            logger.info(f"[Danbooru] 获取到 {len(urls)} 张图片" + (" (筛选模式)" if filtered else ""))
+            return random.choice(urls) if urls else ""
         except Exception as e:
-            logger.error(f"[DEBUG] 未知错误: {type(e).__name__}: {e}, tag={tag}")
-            import traceback
-            logger.error(f"[DEBUG] 堆栈跟踪: {traceback.format_exc()}")
+            logger.error(f"[Danbooru] API错误: {e}")
             return ""
-    
-    async def _download_image(self, session: aiohttp.ClientSession, url: str) -> str:
-        """下载图片到本地临时目录"""
-        logger.info(f"[DEBUG] 开始下载图片: {url}")
+
+    def _download(self, url: str) -> bytes:
+        try:
+            resp = self.session.get(url, auth=(self.username, self.api_key),
+                                   proxies=self._get_proxy_dict(), timeout=15)
+            return resp.content if resp.status_code == 200 else b""
+        except:
+            return b""
+
+    def _compress(self, img_bytes: bytes) -> str:
+        tmp_dir = Path("/tmp/astrbot_img")
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        file_path = tmp_dir / f"{uuid.uuid4().hex}.jpg"
         
         try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Connection": "keep-alive",
-            }
+            img = PILImage.open(io.BytesIO(img_bytes))
+            if getattr(img, "is_animated", False):
+                with open(file_path, "wb") as f:
+                    f.write(img_bytes)
+                return str(file_path)
             
-            async with session.get(url, headers=headers, timeout=60, proxy=self.proxy if self.proxy else None) as response:
-                logger.info(f"[DEBUG] 下载响应状态码: {response.status}")
-                
-                if response.status != 200:
-                    logger.error(f"[DEBUG] 下载失败: HTTP {response.status}")
-                    return ""
-                
-                content = await response.read()
-                logger.info(f"[DEBUG] 下载内容大小: {len(content)} bytes")
-                
-                # 从 URL 中提取扩展名
-                ext = os.path.splitext(url.split("?")[0])[1]
-                if not ext or ext.lower() not in IMAGE_EXTENSIONS:
-                    # 尝试从 Content-Type 获取
-                    content_type = response.headers.get('Content-Type', '')
-                    if 'png' in content_type:
-                        ext = '.png'
-                    elif 'jpeg' in content_type or 'jpg' in content_type:
-                        ext = '.jpg'
-                    elif 'gif' in content_type:
-                        ext = '.gif'
-                    elif 'webp' in content_type:
-                        ext = '.webp'
-                    else:
-                        ext = '.jpg'  # 默认
-                        logger.warning(f"[DEBUG] 未知扩展名，使用默认 .jpg, URL: {url}")
-                
-                filename = f"temp_{uuid.uuid4().hex}{ext}"
-                save_path = self.temp_dir / filename
-                
-                logger.info(f"[DEBUG] 保存图片到: {save_path}")
-                
-                # 异步写入文件
-                await asyncio.to_thread(self._write_file, save_path, content)
-                
-                logger.info(f"[DEBUG] 图片下载完成: {filename}")
-                return str(save_path)
-                
-        except asyncio.TimeoutError:
-            logger.error(f"[DEBUG] 下载超时: {url}")
-            return ""
-        except aiohttp.ClientError as e:
-            logger.error(f"[DEBUG] 下载网络错误: {type(e).__name__}: {e}")
-            return ""
+            if img.mode in ('RGBA', 'LA', 'P') or img.format == 'PNG':
+                img = img.convert('RGB')
+            
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            with open(file_path, "wb") as f:
+                f.write(buf.getvalue())
+            
+            logger.info(f"[Danbooru] 压缩: {len(img_bytes)//1024}KB -> {len(buf.getvalue())//1024}KB")
         except Exception as e:
-            logger.error(f"[DEBUG] 下载未知错误: {type(e).__name__}: {e}")
-            import traceback
-            logger.error(f"[DEBUG] 堆栈跟踪: {traceback.format_exc()}")
-            return ""
-    
-    def _write_file(self, path: Path, content: bytes):
-        """同步写入文件"""
-        with open(path, 'wb') as f:
-            f.write(content)
-    
-    async def _send_as_forward(self, event: AstrMessageEvent, image_path: str, character_name: str) -> None:
-        """使用转发消息发送图片（更安全，不易被风控）"""
-        logger.info(f"[DEBUG] 使用转发消息模式发送图片: {character_name}, path={image_path}")
+            logger.warning(f"[Danbooru] 压缩失败: {e}, 使用原始文件")
+            with open(file_path, "wb") as f:
+                f.write(img_bytes)
+        return str(file_path)
+
+    async def _send_image(self, event: AstrMessageEvent, name: str, rating: str, solo: bool, order: str, icon: str, filtered: bool = False):
+        tag = self.characters_map[name]
+        if solo:
+            tag = f"{tag} solo"
         
-        try:
-            # 获取机器人自身ID
-            self_id = str(event.get_self_id() or "123456")
+        rating_display = {"all": "全随机", "r18": "R18", "safe": "全年龄"}[rating]
+        filter_text = " (筛选)" if filtered else ""
+        yield event.plain_result(f"{icon} {rating_display}{' (单人)' if solo else ''}{filter_text} | 正在获取 {name} 的图片...")
+        
+        for attempt in range(2):
+            if attempt > 0:
+                logger.info(f"[Danbooru] 第 {attempt+1} 次重试...")
             
-            # 构建转发消息节点
-            node = Node(
-                name="Danbooru美图",
-                uin=self_id,
-                content=[
-                    Plain(f"🎨 {character_name} 的美图\n"),
-                    Image(file=image_path),
-                    Plain(f"\n📝 来源: Danbooru | 仅供欣赏")
-                ]
-            )
+            url = await asyncio.to_thread(self._fetch_image, tag, rating, order, 30 if order == "id" else 200, filtered)
+            if not url:
+                continue
             
-            forward_msg = Nodes(nodes=[node])
-            yield event.chain_result([forward_msg])
-            logger.info(f"[DEBUG] 转发消息发送成功: {character_name}")
+            img_bytes = await asyncio.to_thread(self._download, url)
+            if not img_bytes:
+                continue
             
-        except Exception as e:
-            logger.error(f"[DEBUG] 转发消息发送失败: {e}，降级为直接发送")
-            # 降级处理
-            yield event.image_result(image_path)
-    
-    async def _send_as_direct(self, event: AstrMessageEvent, image_path: str, character_name: str) -> None:
-        """直接发送图片"""
-        logger.info(f"[DEBUG] 使用直接发送模式: {character_name}, path={image_path}")
-        yield event.image_result(image_path)
-        logger.info(f"[DEBUG] 直接发送成功: {character_name}")
+            tmp_file = ""
+            try:
+                tmp_file = await asyncio.to_thread(self._compress, img_bytes)
+                logger.info("[Danbooru] 发送中...")
+                
+                if rating == "r18":
+                    now = time()
+                    elapsed = now - self.last_r18_time
+                    if elapsed < R18_COOLDOWN and self.last_r18_time > 0:
+                        wait_time = int(R18_COOLDOWN - elapsed) + 1
+                        logger.info(f"[Danbooru] R18 冷却中，等待 {wait_time} 秒...")
+                        yield event.plain_result(f"⏳ R18 发送冷却中，请 {wait_time} 秒后重试")
+                        return
+                    
+                    logger.info("[Danbooru] R18 模式，使用合并转发...")
+                    
+                    # 固定使用机器人自己的信息
+                    node = Node(
+                        uin=3159302040,
+                        name="艾莉丝",
+                        content=[Plain("📸"), AstrImage(file=tmp_file)]
+                    )
+                    
+                    self.last_r18_time = now
+                    yield event.chain_result([node])
+                else:
+                    chain = event.plain_result("")
+                    chain.chain = [AstrImage(file=tmp_file)]
+                    yield chain
+                
+                asyncio.create_task(delay_delete_file(tmp_file, 60))
+                return
+            except asyncio.TimeoutError:
+                logger.warning(f"[Danbooru] 发送超时")
+                if tmp_file and os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except Exception as e:
+                logger.warning(f"[Danbooru] 发送失败: {e}")
+                if tmp_file and os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+        
+        yield event.plain_result("❌ 发送失败，请稍后重试")
 
     @filter.command("美图")
-    async def handle_meitu_command(self, event: AstrMessageEvent):
-        # 获取命令参数
-        char_name = event.message_str.replace("美图", "", 1).strip()
-        
-        logger.info(f"[DEBUG] 收到美图命令: char_name='{char_name}', 原始消息='{event.message_str}'")
-        
-        if not char_name:
-            chars = "\n".join(CHARACTERS_MAP.keys())
-            logger.info(f"[DEBUG] 未指定角色名，返回帮助信息")
-            yield event.plain_result(f"请指定角色名！\n用法：美图 <角色名>\n支持的角色：\n{chars}")
+    async def meitu(self, event: AstrMessageEvent):
+        if self.is_sending:
+            yield event.plain_result("⚠️ 上一张还在发送，请稍等")
             return
-        
-        if char_name not in CHARACTERS_MAP:
-            chars = "\n".join(CHARACTERS_MAP.keys())
-            logger.warning(f"[DEBUG] 未知角色: {char_name}")
-            yield event.plain_result(f"未知角色！支持的角色：\n{chars}")
-            return
-        
-        # 检查配置
-        if not self.username or not self.api_key:
-            logger.error(f"[DEBUG] 配置缺失: username={bool(self.username)}, api_key={bool(self.api_key)}")
-            yield event.plain_result("请先在插件配置中填写Danbooru用户名和API Key")
-            return
-        
-        logger.info(f"[DEBUG] 配置检查通过: username={self.username}")
-        yield event.plain_result(f"正在获取 [{char_name}] 的美图...")
-        
-        local_path = ""
+        self.is_sending = True
         try:
-            # 创建带超时配置的 ClientSession
-            connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
-            timeout = aiohttp.ClientTimeout(total=60)
-            
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                logger.info(f"[DEBUG] 开始获取图片URL: tag={CHARACTERS_MAP[char_name]}")
-                image_url = await self._fetch_random_image(session, self.username, self.api_key, CHARACTERS_MAP[char_name])
-                
-                if not image_url:
-                    logger.error(f"[DEBUG] 获取图片URL失败: {char_name}")
-                    yield event.plain_result(f"未找到角色 [{char_name}] 的图片")
-                    return
-                
-                logger.info(f"[DEBUG] 获取到图片URL: {image_url}")
-                local_path = await self._download_image(session, image_url)
-                
-                if not local_path:
-                    logger.error(f"[DEBUG] 下载图片失败: {image_url}")
-                    yield event.plain_result("下载图片失败")
-                    return
-                
-                logger.info(f"[DEBUG] 图片下载完成: {local_path}")
-                
-                # 根据配置选择发送方式
-                if self.send_mode == "forward":
-                    await self._send_as_forward(event, local_path, char_name)
-                else:
-                    await self._send_as_direct(event, local_path, char_name)
-                
-        except Exception as e:
-            logger.error(f"[DEBUG] 发送美图异常: {type(e).__name__}: {e}")
-            import traceback
-            logger.error(f"[DEBUG] 堆栈跟踪: {traceback.format_exc()}")
-            yield event.plain_result(f"发送失败: {str(e)}")
+            parts = event.message_str.replace("美图", "").strip().split()
+            name, rating, solo, filtered = self._parse_args(parts)
+            if not name:
+                yield event.plain_result("用法: 美图 角色名 [单人] [r18/safe] [筛选]")
+                return
+            if name not in self.characters_map:
+                yield event.plain_result(f"角色 [{name}] 不存在")
+                return
+            async for result in self._send_image(event, name, rating, solo, "random", "🎲", filtered):
+                yield result
         finally:
-            # 清理临时文件
-            if local_path and os.path.exists(local_path):
-                try:
-                    os.remove(local_path)
-                    logger.info(f"[DEBUG] 临时文件已删除: {local_path}")
-                except Exception as e:
-                    logger.error(f"[DEBUG] 清理临时文件失败: {e}")
-    
-    @filter.command("美图角色")
-    async def handle_characters_command(self, event: AstrMessageEvent):
-        chars = "\n".join(CHARACTERS_MAP.keys())
-        logger.info(f"[DEBUG] 返回支持的角色列表，共 {len(CHARACTERS_MAP)} 个")
-        yield event.plain_result(f"支持的角色列表：\n{chars}")
-    
-    async def terminate(self):
-        logger.info("[DEBUG] Danbooru插件正在卸载...")
-        pass
+            self.is_sending = False
+
+    @filter.command("新图")
+    async def new_image(self, event: AstrMessageEvent):
+        if self.is_sending:
+            yield event.plain_result("⚠️ 上一张还在发送，请稍等")
+            return
+        self.is_sending = True
+        try:
+            parts = event.message_str.replace("新图", "").strip().split()
+            name, rating, solo, filtered = self._parse_args(parts)
+            if not name:
+                yield event.plain_result("用法: 新图 角色名 [r18/safe] [筛选]")
+                return
+            if name not in self.characters_map:
+                yield event.plain_result(f"角色 [{name}] 不存在")
+                return
+            async for result in self._send_image(event, name, rating, solo, "id", "🆕", filtered):
+                yield result
+        finally:
+            self.is_sending = False
