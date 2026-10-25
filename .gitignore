@@ -1,44 +1,20 @@
-# 环境变量文件（包含敏感信息）
-.env
-.env.local
-.env.*.local
-
-# 下载的图片和视频
-**/downloads/
-**/*.jpg
-**/*.jpeg
-**/*.png
-**/*.gif
-**/*.webp
-**/*.mp4
-**/*.webm
-
-# 压缩包
-*.rar
-*.zip
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-.venv/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# 系统文件
-.DS_Store
-Thumbs.db
-
-# 日志
-*.log
-
-# 临时文件
-*.tmp
+# Runtime-only repository. New files stay private until explicitly allowlisted.
+*
+!.gitignore
+!__init__.py
+!_conf_schema.json
+!main.py
+!mapping.py
+!metadata.json
+!metadata.yaml
+!character_index.py
+!character_overrides.json
+!history_store.py
+!mapping_parser.py
+!media.py
+!play_modes.py
+!query_planner.py
+!selector.py
+!send_service.py
+!session_policy.py
+!session_state.py
