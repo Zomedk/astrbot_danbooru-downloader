@@ -37,13 +37,13 @@ def week_intent(record, scope: str, rating: str, *, solo: bool = False,
                                       solo=solo, filtered=filtered))
 
 
-def duo_intent(first, second, scope: str, rating: str) -> SearchIntent:
+def duo_intent(first, second, scope: str, rating: str, *, filtered: bool = False) -> SearchIntent:
     if first.id == second.id:
         raise ValueError("请选择两个不同的人物")
     if " " in first.base_tag or " " in second.base_tag:
         raise ValueError("合照需要两个可单独查询的人物本体标签")
     return SearchIntent("new", f"{first.id}+{second.id}",
-                        f"{first.base_tag} {second.base_tag}", rating, False, False,
+                        f"{first.base_tag} {second.base_tag}", rating, False, filtered,
                         scope, (), (first.base_tag, second.base_tag))
 
 

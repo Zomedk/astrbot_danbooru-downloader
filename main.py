@@ -490,15 +490,15 @@ class DanbooruDownloaderPlugin(Star):
             yield event.plain_result("⚠️ 上一张还在发送，请稍等")
             return
         names, rating, solo, filtered = self._parse_args(self._tail(event, "合照").split(), self._default_rating(event))
-        if solo or filtered:
-            yield event.plain_result("合照请只指定两个人物和分级；例如：合照 原神:胡桃 原神:芙宁娜 safe")
+        if solo:
+            yield event.plain_result("合照需要两个人物，不能同时指定单人")
             return
         pair = self._split_duo(names)
         if not pair:
             yield event.plain_result("请指定两个明确人物；例如：合照 原神:胡桃 原神:芙宁娜")
             return
         try:
-            intent = duo_intent(*pair, event.unified_msg_origin, rating)
+            intent = duo_intent(*pair, event.unified_msg_origin, rating, filtered=filtered)
         except ValueError as exc:
             yield event.plain_result(str(exc))
             return
