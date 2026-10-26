@@ -8,12 +8,14 @@
 !metadata.json
 !metadata.yaml
 !character_index.py
+!danbooru_api.py
 !character_overrides.json
 !history_store.py
 !mapping_parser.py
 !media.py
 !play_modes.py
 !query_planner.py
+!search_service.py
 !selector.py
 !send_service.py
 !session_policy.py

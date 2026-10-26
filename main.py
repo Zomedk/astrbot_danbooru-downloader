@@ -6,7 +6,7 @@ import random
 import re
 import secrets
 from pathlib import Path
-from time import monotonic, perf_counter, sleep, time
+from time import perf_counter, time
 
 import requests
 
@@ -17,30 +17,18 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .character_index import Ambiguous, CharacterIndex, LegacyQuery, NotFound, Resolved
+from .danbooru_api import DanbooruApiClient, FetchError, QueryBudgetError
 from .history_store import HistoryStore, PendingSendStore
 from .mapping import RAW_DICT_GENSHIN_IMPACT
 from .media import choose_media_url, download_image, prepare_image
 from .play_modes import character_intent, curated_intent, duo_intent, variant_intent, week_intent
-from .query_planner import PlanError, SearchIntent, build_query_plan, recent_fallback
-from .selector import choose_new, choose_random
+from .query_planner import PlanError, SearchIntent
+from .search_service import SearchService
 from .session_state import SessionState
 from .session_policy import SessionPolicy
 from .send_service import DeliveryStatus, submit_one_image
 
 PLUGIN_NAME = "astrbot_danbooru_downloader"
-BASE_URL = "https://danbooru.donmai.us/posts.json"
-
-
-class FetchError(RuntimeError):
-    def __init__(self, status: int):
-        super().__init__(f"Danbooru HTTP {status}")
-        self.status = status
-
-
-class QueryBudgetError(RuntimeError):
-    pass
-
-
 async def delay_delete_file(path: Path, delay: int = 60) -> None:
     await asyncio.sleep(delay)
     try:
@@ -80,13 +68,16 @@ class DanbooruDownloaderPlugin(Star):
         self.is_sending = False
         self._last_delivery_status = ""
         self.in_flight: set[int] = set()
-        self._trace = None
-        self._last_api_call = 0.0
-
         self.session = requests.Session()
         identity = self.username or "anonymous"
         self.session.headers.update({"User-Agent": f"AstrBot-Danbooru/4.2 ({identity})",
                                      "Accept": "application/json"})
+        self.api = DanbooruApiClient(
+            self.session, auth=self._auth(), proxies=self._get_proxy_dict(),
+            retry_limit=self.api_transient_retry_limit,
+        )
+        self.search = SearchService(self.new_limit, self.random_sample_limit,
+                                    self.new_max_extra_pages)
         self.characters_map: dict[str, str] = {}
         for aliases, tag in RAW_DICT_GENSHIN_IMPACT.items():
             for alias in aliases.split("|"):
@@ -185,53 +176,6 @@ class DanbooruDownloaderPlugin(Star):
             return f"没有找到“{name}”" + (f"；你可能想找：{hints}" if hints else "")
         return "角色解析失败"
 
-    def _fetch_posts(self, plan, page: str | None = None) -> list[dict]:
-        for attempt in range(self.api_transient_retry_limit + 1):
-            if self._trace is not None and self._trace["request_count"] >= 6:
-                raise QueryBudgetError("per-command API budget exhausted")
-            wait = 1.0 - (monotonic() - self._last_api_call)
-            if wait > 0:
-                sleep(wait)
-            self._last_api_call = monotonic()
-            if self._trace is not None:
-                self._trace["request_count"] += 1
-            started = perf_counter()
-            try:
-                response = self.session.get(
-                    BASE_URL, params=plan.params(page), auth=self._auth(),
-                    proxies=self._get_proxy_dict(), timeout=(5, 15),
-                )
-                try:
-                    status = response.status_code
-                    if status != 200:
-                        retry_after = getattr(response, "headers", {}).get("Retry-After", "")
-                        try:
-                            retry_seconds = float(retry_after)
-                        except (TypeError, ValueError):
-                            retry_seconds = 1.0
-                        if status in {429, 500, 502, 503} and attempt < self.api_transient_retry_limit:
-                            if status != 429 or 0 <= retry_seconds <= 2:
-                                sleep(max(1.0, retry_seconds))
-                                continue
-                        raise FetchError(status)
-                    posts = response.json()
-                    if not isinstance(posts, list):
-                        raise ValueError("Danbooru 返回内容不是帖子列表")
-                    return posts
-                finally:
-                    response.close()
-            except requests.RequestException:
-                if attempt >= self.api_transient_retry_limit:
-                    raise
-                sleep(1.0)
-            finally:
-                if self._trace is not None:
-                    self._trace["api_ms"] += int((perf_counter() - started) * 1000)
-        return []
-
-    async def _fetch_async(self, plan, page: str | None):
-        return await asyncio.to_thread(self._fetch_posts, plan, page)
-
     def _excluded_ids(self, scope: str) -> set[int]:
         return self.in_flight | self.pending.ids(scope)
 
@@ -254,7 +198,6 @@ class DanbooruDownloaderPlugin(Star):
         trace = {"api_ms": 0, "download_ms": 0, "process_ms": 0, "send_ms": 0,
                  "request_count": 0, "bytes_in": 0, "bytes_out": 0, "post_id": 0,
                  "source_rating": "-", "outcome": "failed", "reason": "preflight"}
-        self._trace = trace
         self._last_delivery_status = "blocked"
         try:
             decision = self.policy.decide(scope, bool(event.get_group_id()), intent.rating)
@@ -270,26 +213,18 @@ class DanbooruDownloaderPlugin(Star):
                 return False, "发图记录暂不可用，请管理员检查日志"
             from dataclasses import replace
             effective_intent = replace(intent, rating=decision.query_rating)
+            async def fetch(plan, page):
+                return await self.api.fetch(plan, page, trace=trace)
+
             try:
-                plan = build_query_plan(effective_intent, new_limit=self.new_limit,
-                                        random_sample_limit=self.random_sample_limit)
-                fallback = recent_fallback(effective_intent, new_limit=self.new_limit) if intent.mode == "random" and intent.solo else None
+                selection = await self.search.select(
+                    effective_intent, fetch, self.history,
+                    excluded=self._excluded_ids(scope), allowed_ratings=decision.allowed,
+                    sample_attempts=sample_attempts, extra_pages=extra_pages,
+                )
             except PlanError as exc:
                 trace["reason"] = "query_plan"
                 return False, f"无法查询：{exc}"
-            pages = self.new_max_extra_pages if extra_pages is None else extra_pages
-            try:
-                if intent.mode == "new":
-                    selection = await choose_new(plan, self._fetch_async, self.history, scope,
-                                                 decision.query_rating, extra_pages=pages,
-                                                 excluded=self._excluded_ids(scope),
-                                                 allowed_ratings=decision.allowed)
-                else:
-                    selection = await choose_random(plan, self._fetch_async, self.history, scope,
-                                                    decision.query_rating, fallback=fallback,
-                                                    extra_pages=pages, excluded=self._excluded_ids(scope),
-                                                    sample_attempts=sample_attempts,
-                                                    allowed_ratings=decision.allowed)
             except FetchError as exc:
                 trace["reason"] = f"api_{exc.status}"
                 logger.warning(f"[Danbooru] req={req_id} API HTTP {exc.status}")
@@ -366,7 +301,6 @@ class DanbooruDownloaderPlugin(Star):
                         f"bytes_in={trace['bytes_in']} bytes_out={trace['bytes_out']} "
                         f"requests={trace['request_count']} outcome={trace['outcome']} "
                         f"reason={trace['reason']} total_ms={int((perf_counter()-started)*1000)}")
-            self._trace = None
 
     def _standard_intent(self, name: str, scope: str, rating: str,
                          mode: str, solo: bool, filtered: bool):
