@@ -1,618 +1,344 @@
-"""AstrBot Danbooru commands with shared planning, selection and delivery."""
-
-import asyncio
-import hashlib
-import random
-import re
-import secrets
+import os, random, io, asyncio, uuid
+from collections import deque
+from PIL import Image as PILImage
 from pathlib import Path
-from time import monotonic, perf_counter, sleep, time
-
-import requests
+from typing import Tuple
+from time import time
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image as AstrImage, Node, Plain
 from astrbot.api.star import Context, Star, register
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-
-from .character_index import Ambiguous, CharacterIndex, LegacyQuery, NotFound, Resolved
-from .history_store import HistoryStore, PendingSendStore
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.message_components import Image as AstrImage, Node, Plain
 from .mapping import RAW_DICT_GENSHIN_IMPACT
-from .media import choose_media_url, download_image, prepare_image
-from .play_modes import character_intent, curated_intent, duo_intent, variant_intent, week_intent
-from .query_planner import PlanError, SearchIntent, build_query_plan, recent_fallback
-from .selector import choose_new, choose_random
-from .session_state import SessionState
-from .session_policy import SessionPolicy
-from .send_service import DeliveryStatus, submit_one_image
 
-PLUGIN_NAME = "astrbot_danbooru_downloader"
 BASE_URL = "https://danbooru.donmai.us/posts.json"
+RATING_MAP = {"all": "rating:g~rating:q", "safe": "rating:g", "r18": "rating:e"}
 
+R18_COOLDOWN = 30
+DEFAULT_NEW_LIMIT = 100
+MAX_API_LIMIT = 200
+RECENT_HISTORY = 1000
+RANDOM_SAMPLE_LIMIT = 30
+SOLO_RANDOM_SAMPLE_LIMIT = 50
+FREE_METATAGS = {
+    "rating", "status", "is", "age", "date", "id", "limit", "score",
+    "downvotes", "favcount", "width", "height", "ratio", "mpixels",
+    "filesize", "filetype", "duration", "md5", "pixiv_id", "pixiv",
+    "parent", "child", "upvote", "embedded", "tagcount",
+}
+MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
 
-class FetchError(RuntimeError):
-    def __init__(self, status: int):
-        super().__init__(f"Danbooru HTTP {status}")
-        self.status = status
-
-
-class QueryBudgetError(RuntimeError):
-    pass
-
-
-async def delay_delete_file(path: Path, delay: int = 60) -> None:
-    await asyncio.sleep(delay)
+async def delay_delete_file(file_path: str, delay: int = 60):
     try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning(f"[Danbooru] 临时文件清理失败: {type(exc).__name__}")
+        await asyncio.sleep(delay)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info(f"[Danbooru] 已删除缓存 {os.path.basename(file_path)}")
+    except asyncio.CancelledError:
+        raise
+    except OSError as e:
+        logger.warning(f"[Danbooru] 删除缓存失败 {os.path.basename(file_path)}: {e}")
 
-
-def _bounded(value, default: int, low: int, high: int) -> int:
-    try:
-        return max(low, min(int(value), high))
-    except (TypeError, ValueError):
-        return default
-
-
-@register(PLUGIN_NAME, "Zomedk", "Danbooru美图插件", "4.2.0")
+@register("astrbot_danbooru_downloader", "Zomedk", "Danbooru美图插件", "4.2.1")
 class DanbooruDownloaderPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
-        self.username = self.config.get("username") or ""
-        self.api_key = self.config.get("api_key") or ""
-        self.proxy = self.config.get("proxy") or ""
-        self.new_limit = _bounded(self.config.get("new_limit"), 100, 1, 200)
-        self.random_sample_limit = _bounded(self.config.get("random_sample_limit"), 30, 1, 200)
-        self.new_max_extra_pages = _bounded(self.config.get("new_max_extra_pages"), 2, 0, 5)
-        self.prefer_large_above_mib = _bounded(self.config.get("prefer_large_above_mib"), 3, 1, 16)
-        self.featured_min_score = _bounded(self.config.get("featured_min_score"), 30, 0, 1000)
-        self.policy = SessionPolicy(self.config)
-        self.send_mode = self.config.get("send_mode", "direct")
-        if self.send_mode not in {"direct", "forward"}:
-            self.send_mode = "direct"
-        self.max_download_bytes = _bounded(self.config.get("max_download_mib"), 32, 1, 32) * 1024 * 1024
-        self.max_image_pixels = _bounded(self.config.get("max_image_megapixels"), 40, 1, 40) * 1000000
-        self.media_retry_candidates = _bounded(self.config.get("media_retry_candidates"), 1, 0, 2)
-        self.api_transient_retry_limit = _bounded(self.config.get("api_transient_retry_limit"), 1, 0, 1)
+        self.username = self.config.get("username")
+        self.api_key = self.config.get("api_key")
+        self.proxy = self.config.get("proxy")
         self.is_sending = False
-        self._last_delivery_status = ""
-        self.in_flight: set[int] = set()
-        self._trace = None
-        self._last_api_call = 0.0
-
+        self.last_r18_time = 0
+        self.recent_post_ids = {}
+        try:
+            self.new_limit = max(
+                1,
+                min(int(self.config.get("new_limit", DEFAULT_NEW_LIMIT)), MAX_API_LIMIT),
+            )
+        except (TypeError, ValueError):
+            self.new_limit = DEFAULT_NEW_LIMIT
+        
+        import requests
         self.session = requests.Session()
-        identity = self.username or "anonymous"
-        self.session.headers.update({"User-Agent": f"AstrBot-Danbooru/4.2 ({identity})",
-                                     "Accept": "application/json"})
-        self.characters_map: dict[str, str] = {}
-        for aliases, tag in RAW_DICT_GENSHIN_IMPACT.items():
-            for alias in aliases.split("|"):
-                alias = alias.strip()
-                if alias:
-                    self.characters_map.setdefault(alias, tag.strip())
-
-        folder = Path(__file__).resolve().parent
-        self.index = CharacterIndex.from_files(folder / "mapping.py", folder / "character_overrides.json")
-        self.state = SessionState()
-        data_dir = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
-        self.history = HistoryStore(
-            data_dir / "history.json",
-            max_per_scope=_bounded(self.config.get("history_max_per_session"), 1000, 1, 10000),
-            days=_bounded(self.config.get("history_days"), 30, 1, 365), logger=logger,
-        )
-        self.pending = PendingSendStore(
-            data_dir / "pending_send.json",
-            hold_minutes=_bounded(self.config.get("uncertain_hold_minutes"), 30, 1, 1440), logger=logger,
-        )
-        self.temp_dir = data_dir / "temp"
-        self._cleanup_old_temp()
-        logger.info(f"[Danbooru] 已索引 {len(self.index.characters)} 个人物候选、{len(self.index.alias_to_candidates)} 个别名")
+        self.session.headers.update({"User-Agent": f"Danbooru/1.0 ({self.username})", "Accept": "application/json"})
+        
+        self.characters_map = {}
+        for keys, tag in RAW_DICT_GENSHIN_IMPACT.items():
+            for alias in keys.split("|"):
+                if alias.strip():
+                    self.characters_map[alias.strip()] = tag
+        
+        # 固定机器人信息
+        self.bot_uin = 2807007579
+        self.bot_name = "艾莉丝"
+        
+        logger.info(f"[Danbooru] 已加载 {len(self.characters_map)} 个角色")
+        logger.info(f"[Danbooru] 机器人 UIN: {self.bot_uin}, 名称: {self.bot_name}")
 
     def _get_proxy_dict(self):
         return {"http": self.proxy, "https": self.proxy} if self.proxy else None
 
-    def _auth(self):
-        return (self.username, self.api_key) if self.username and self.api_key else None
-
-    @staticmethod
-    def _tail(event: AstrMessageEvent, command: str) -> str:
-        raw = event.message_str.strip()
-        return raw.split(command, 1)[1].strip() if command in raw else raw
-
-    @staticmethod
-    def _sender(event: AstrMessageEvent) -> str:
-        getter = getattr(event, "get_sender_id", None)
-        return str(getter()) if callable(getter) else "unknown"
-
-    def _default_rating(self, event: AstrMessageEvent) -> str:
-        return self.policy.default_request(event.unified_msg_origin, bool(event.get_group_id()))
-
-    def _cleanup_old_temp(self) -> None:
-        if not self.temp_dir.exists():
-            return
-        cutoff = time() - 3600
-        for path in self.temp_dir.iterdir():
-            if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
-                try:
-                    if path.stat().st_mtime < cutoff:
-                        path.unlink()
-                except OSError:
-                    pass
-
-    async def terminate(self):
-        # Do not close a Session while its single active download still uses it.
-        for _ in range(50):
-            if not self.is_sending:
-                self.session.close()
-                return
-            await asyncio.sleep(0.1)
-        logger.warning("[Danbooru] 卸载时仍有发图任务，保留会话至任务退出")
-
-    def _parse_args(self, parts: list[str], default_rating: str):
-        rating, solo, filtered = default_rating, False, False
-        parts = list(parts)
-        while parts:
-            option = parts[-1].lower()
-            if parts[-1] == "单人":
+    def _parse_args(self, args: list) -> Tuple[str, str, bool, bool]:
+        if not args:
+            return None, "all", False, False
+        name = args[0]
+        rating = "all"
+        solo = False
+        filtered = False
+        for p in args[1:]:
+            if p == "单人":
                 solo = True
-            elif parts[-1] == "筛选":
+            elif p == "筛选":
                 filtered = True
-            elif option == "r18":
+            elif p.lower() == "r18":
                 rating = "r18"
-            elif option in {"safe", "全年龄"}:
+            elif p.lower() in ["safe", "全年龄"]:
                 rating = "safe"
-            else:
-                break
-            parts.pop()
-        name = " ".join(parts)
-        compact = "".join(parts)
-        if name not in self.characters_map and compact in self.characters_map:
-            name = compact
         return name, rating, solo, filtered
 
     @staticmethod
-    def _resolution_error(name: str, result) -> str:
-        if isinstance(result, Ambiguous):
-            options = "、".join(f"{item.franchise_name}:{item.display_name}" for item in result.candidates[:5])
-            return f"“{name}”对应多个人物，请指定作品：{options}"
-        if isinstance(result, NotFound):
-            if result.reason:
-                return result.reason
-            hints = "、".join(result.suggestions[:5])
-            return f"没有找到“{name}”" + (f"；你可能想找：{hints}" if hints else "")
-        return "角色解析失败"
+    def _regular_tag_count(query: str) -> int:
+        count = 0
+        for token in query.split():
+            if token == "~":
+                continue
+            term = token.lstrip("~-+")
+            key = term.split(":", 1)[0].lower() if ":" in term else ""
+            if key not in FREE_METATAGS:
+                count += 1
+        return count
 
-    def _fetch_posts(self, plan, page: str | None = None) -> list[dict]:
-        for attempt in range(self.api_transient_retry_limit + 1):
-            if self._trace is not None and self._trace["request_count"] >= 6:
-                raise QueryBudgetError("per-command API budget exhausted")
-            wait = 1.0 - (monotonic() - self._last_api_call)
-            if wait > 0:
-                sleep(wait)
-            self._last_api_call = monotonic()
-            if self._trace is not None:
-                self._trace["request_count"] += 1
-            started = perf_counter()
-            try:
-                response = self.session.get(
-                    BASE_URL, params=plan.params(page), auth=self._auth(),
-                    proxies=self._get_proxy_dict(), timeout=(5, 15),
-                )
-                try:
-                    status = response.status_code
-                    if status != 200:
-                        retry_after = getattr(response, "headers", {}).get("Retry-After", "")
-                        try:
-                            retry_seconds = float(retry_after)
-                        except (TypeError, ValueError):
-                            retry_seconds = 1.0
-                        if status in {429, 500, 502, 503} and attempt < self.api_transient_retry_limit:
-                            if status != 429 or 0 <= retry_seconds <= 2:
-                                sleep(max(1.0, retry_seconds))
-                                continue
-                        raise FetchError(status)
-                    posts = response.json()
-                    if not isinstance(posts, list):
-                        raise ValueError("Danbooru 返回内容不是帖子列表")
-                    return posts
-                finally:
-                    response.close()
-            except requests.RequestException:
-                if attempt >= self.api_transient_retry_limit:
-                    raise
-                sleep(1.0)
-            finally:
-                if self._trace is not None:
-                    self._trace["api_ms"] += int((perf_counter() - started) * 1000)
-        return []
-
-    async def _fetch_async(self, plan, page: str | None):
-        return await asyncio.to_thread(self._fetch_posts, plan, page)
-
-    def _excluded_ids(self, scope: str) -> set[int]:
-        return self.in_flight | self.pending.ids(scope)
-
-    def _message_chain(self, event: AstrMessageEvent, path: Path, caption: str) -> MessageChain:
-        image = AstrImage(file=str(path))
-        content = [Plain(caption), image] if caption else [image]
-        if self.send_mode != "forward":
-            return MessageChain(content)
-        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        bot_id = raw.get("self_id") if isinstance(raw, dict) else None
-        node = Node(uin=int(bot_id or 3159302040), name="艾莉丝", content=content)
-        return MessageChain([node])
-
-    async def _deliver(self, event: AstrMessageEvent, intent: SearchIntent,
-                       *, caption: str = "", sample_attempts: int = 2,
-                       extra_pages: int | None = None) -> tuple[bool, str]:
-        scope, sender = intent.scope_id, self._sender(event)
-        req_id = secrets.token_hex(4)
-        started = perf_counter()
-        trace = {"api_ms": 0, "download_ms": 0, "process_ms": 0, "send_ms": 0,
-                 "request_count": 0, "bytes_in": 0, "bytes_out": 0, "post_id": 0,
-                 "source_rating": "-", "outcome": "failed", "reason": "preflight"}
-        self._trace = trace
-        self._last_delivery_status = "blocked"
+    def _fetch_image(self, tag: str, rating: str, order: str, limit: int,
+                     filtered: bool = False, solo_only: bool = False) -> list[dict] | None:
+        tag_parts = [tag]
+        site_random = order == "random" and self._regular_tag_count(tag) < 2
+        if site_random:
+            limit = SOLO_RANDOM_SAMPLE_LIMIT if solo_only else RANDOM_SAMPLE_LIMIT
+            tag_parts.append(f"random:{limit}")
+        elif order == "random":
+            logger.info("[Danbooru] 映射已占满免费账户两标签，本次从近期结果随机选择")
+        if rating != "all" and RATING_MAP.get(rating):
+            tag_parts.append(RATING_MAP[rating])
+        if filtered:
+            tag_parts.append("score:>30")
+        tags = " ".join(tag_parts)
+        limit = max(1, min(int(limit), MAX_API_LIMIT))
+        params = {"tags": tags, "limit": limit}
+        if not site_random:
+            params["order"] = "id_desc"
+        
         try:
-            decision = self.policy.decide(scope, bool(event.get_group_id()), intent.rating)
-            if decision.error:
-                trace["reason"] = "rating_denied"
-                return False, decision.error
-            remaining, show = self.policy.check_cooldown(scope, sender)
+            resp = self.session.get(BASE_URL, params=params,
+                                   auth=(self.username, self.api_key),
+                                   proxies=self._get_proxy_dict(), timeout=15)
+            if resp.status_code != 200:
+                logger.warning(f"[Danbooru] 查询失败，HTTP {resp.status_code}")
+                return None
+            posts = resp.json()
+            candidates = [
+                p for p in posts
+                if isinstance(p, dict)
+                and p.get("id") is not None
+                and (p.get("file_url") or p.get("large_file_url"))
+                and (not solo_only or "solo" in str(p.get("tag_string_general") or "").split())
+            ]
+            logger.info(f"[Danbooru] 获取到 {len(candidates)} 张图片" + (" (筛选模式)" if filtered else ""))
+            return candidates
+        except Exception as e:
+            logger.error(f"[Danbooru] API错误: {e}")
+            return None
+
+    def _download(self, url: str) -> bytes:
+        try:
+            resp = self.session.get(url, auth=(self.username, self.api_key),
+                                   proxies=self._get_proxy_dict(), timeout=15)
+            if resp.status_code != 200:
+                logger.warning(f"[Danbooru] 图片下载失败，HTTP {resp.status_code}")
+                return b""
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
+                logger.warning("[Danbooru] 图片超过下载大小限制，已跳过")
+                return b""
+            content = resp.content
+            if len(content) > MAX_DOWNLOAD_BYTES:
+                logger.warning("[Danbooru] 图片超过下载大小限制，已跳过")
+                return b""
+            return content
+        except (TypeError, ValueError):
+            logger.warning("[Danbooru] 图片响应大小字段无效")
+            return b""
+        except Exception as e:
+            logger.warning(f"[Danbooru] 图片下载异常: {e}")
+            return b""
+
+    def _compress(self, img_bytes: bytes) -> str:
+        tmp_dir = Path("/tmp/astrbot_img")
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        file_path = None
+        
+        try:
+            img = PILImage.open(io.BytesIO(img_bytes))
+            width, height = img.size
+            if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+                raise ValueError("图片像素数超过限制")
+
+            if getattr(img, "is_animated", False):
+                image_format = (img.format or "").lower()
+                if image_format not in {"gif", "webp"}:
+                    raise ValueError(f"不支持的动图格式: {image_format or 'unknown'}")
+                file_path = tmp_dir / f"{uuid.uuid4().hex}.{image_format}"
+                with open(file_path, "wb") as f:
+                    f.write(img_bytes)
+                return str(file_path)
+            
+            file_path = tmp_dir / f"{uuid.uuid4().hex}.jpg"
+            img.load()
+            if img.mode in ('RGBA', 'LA', 'P') or img.format == 'PNG':
+                img = img.convert('RGB')
+            
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            with open(file_path, "wb") as f:
+                f.write(buf.getvalue())
+            
+            logger.info(f"[Danbooru] 压缩: {len(img_bytes)//1024}KB -> {len(buf.getvalue())//1024}KB")
+        except Exception as e:
+            logger.warning(f"[Danbooru] 图片处理失败: {e}")
+            if file_path and file_path.exists():
+                try:
+                    file_path.unlink()
+                except OSError:
+                    pass
+            return ""
+        return str(file_path)
+
+    def _choose_post(self, posts: list[dict], scope: str) -> dict | None:
+        if not posts:
+            return None
+
+        recent = self.recent_post_ids.setdefault(
+            scope,
+            deque(maxlen=RECENT_HISTORY),
+        )
+        fresh = [post for post in posts if post.get("id") not in recent]
+        return random.choice(fresh) if fresh else None
+
+    async def _send_image(self, event: AstrMessageEvent, name: str, rating: str, solo: bool, order: str, icon: str, filtered: bool = False):
+        tag = self.characters_map[name].strip()
+        solo_only = solo and (order == "random" or self._regular_tag_count(tag) >= 2)
+        if solo and not solo_only:
+            tag = f"{tag} solo"
+
+        if rating == "r18" and self.last_r18_time > 0:
+            remaining = R18_COOLDOWN - (time() - self.last_r18_time)
             if remaining > 0:
-                trace["reason"] = "cooldown"
-                return False, f"⏳ 发图冷却中，请 {remaining:.1f} 秒后重试" if show else ""
-            if not self.pending.healthy:
-                trace["reason"] = "pending_store_unavailable"
-                return False, "发图记录暂不可用，请管理员检查日志"
-            from dataclasses import replace
-            effective_intent = replace(intent, rating=decision.query_rating)
-            try:
-                plan = build_query_plan(effective_intent, new_limit=self.new_limit,
-                                        random_sample_limit=self.random_sample_limit)
-                fallback = recent_fallback(effective_intent, new_limit=self.new_limit) if intent.mode == "random" and intent.solo else None
-            except PlanError as exc:
-                trace["reason"] = "query_plan"
-                return False, f"无法查询：{exc}"
-            pages = self.new_max_extra_pages if extra_pages is None else extra_pages
-            try:
-                if intent.mode == "new":
-                    selection = await choose_new(plan, self._fetch_async, self.history, scope,
-                                                 decision.query_rating, extra_pages=pages,
-                                                 excluded=self._excluded_ids(scope),
-                                                 allowed_ratings=decision.allowed)
-                else:
-                    selection = await choose_random(plan, self._fetch_async, self.history, scope,
-                                                    decision.query_rating, fallback=fallback,
-                                                    extra_pages=pages, excluded=self._excluded_ids(scope),
-                                                    sample_attempts=sample_attempts,
-                                                    allowed_ratings=decision.allowed)
-            except FetchError as exc:
-                trace["reason"] = f"api_{exc.status}"
-                logger.warning(f"[Danbooru] req={req_id} API HTTP {exc.status}")
-                return False, "Danbooru 查询失败，请稍后重试或调整角色标签"
-            except QueryBudgetError:
-                trace["reason"] = "api_budget"
-                return False, "这次查询尝试次数已达上限，请稍后再试"
-            except (requests.RequestException, ValueError) as exc:
-                trace["reason"] = "api_" + type(exc).__name__
-                logger.warning(f"[Danbooru] req={req_id} API 异常: {type(exc).__name__}")
-                return False, "Danbooru 查询暂时不可用，请稍后重试"
-            if not selection.posts:
-                trace["reason"] = "no_candidate"
-                self._last_delivery_status = "no_candidate"
-                return False, "最近候选已抽完或没有符合条件的图片，可稍后等新投稿"
-            for post in selection.posts[:1 + self.media_retry_candidates]:
-                post_id = int(post["id"])
-                trace["post_id"] = post_id
-                trace["source_rating"] = post.get("rating", "-")
-                if post.get("rating") not in decision.allowed:
-                    continue
-                self.in_flight.add(post_id)
-                path = None
-                try:
-                    try:
-                        url = choose_media_url(post, self.prefer_large_above_mib)
-                        download_started = perf_counter()
-                        data = await asyncio.to_thread(download_image, self.session, url,
-                                                       auth=self._auth(), proxies=self._get_proxy_dict(),
-                                                       max_bytes=self.max_download_bytes)
-                        trace["download_ms"] += int((perf_counter() - download_started) * 1000)
-                        trace["bytes_in"] = len(data)
-                        process_started = perf_counter()
-                        path = await asyncio.to_thread(prepare_image, data, self.temp_dir,
-                                                       max_pixels=self.max_image_pixels,
-                                                       max_output_bytes=self.max_download_bytes)
-                        trace["process_ms"] += int((perf_counter() - process_started) * 1000)
-                        trace["bytes_out"] = path.stat().st_size
-                        chain = self._message_chain(event, path, caption or selection.notice)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        trace["reason"] = "media_" + type(exc).__name__
-                        logger.warning(f"[Danbooru] req={req_id} 媒体准备失败: {type(exc).__name__}")
-                        continue
-                    outcome = await submit_one_image(event, chain, self.history, self.pending,
-                                                     self.state, scope, sender, intent, post, req_id)
-                    trace["send_ms"] = outcome.elapsed_ms
-                    trace["outcome"], trace["reason"] = outcome.status.value, outcome.reason
-                    self._last_delivery_status = outcome.status.value
-                    if outcome.status == DeliveryStatus.ACCEPTED:
-                        self.policy.record(scope, sender, success=True)
-                        if outcome.reason == "history_write_failed":
-                            logger.warning(f"[Danbooru] req={req_id} 已提交但历史写入失败")
-                        return True, ""
-                    if outcome.status == DeliveryStatus.UNCERTAIN:
-                        self.policy.record(scope, sender, success=True)
-                        logger.warning(f"[Danbooru] req={req_id} QQ 结果不明 reason={outcome.reason} auto_retry=false")
-                        return False, "QQ 发送结果暂时无法确认，本次不会自动重试"
-                    return False, "发图记录暂不可用，请管理员检查日志"
-                finally:
-                    self.in_flight.discard(post_id)
-                    if path is not None:
-                        asyncio.create_task(delay_delete_file(path))
-            self.policy.record(scope, sender, success=False)
-            self._last_delivery_status = "media_failed"
-            return False, "候选图片下载或处理失败，请稍后重试"
-        finally:
-            scope_hash = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:8]
-            logger.info(f"[Danbooru] req={req_id} mode={intent.mode} scope={scope_hash} "
-                        f"post={trace['post_id']} rating={trace['source_rating']} "
-                        f"api_ms={trace['api_ms']} download_ms={trace['download_ms']} "
-                        f"process_ms={trace['process_ms']} send_ms={trace['send_ms']} "
-                        f"bytes_in={trace['bytes_in']} bytes_out={trace['bytes_out']} "
-                        f"requests={trace['request_count']} outcome={trace['outcome']} "
-                        f"reason={trace['reason']} total_ms={int((perf_counter()-started)*1000)}")
-            self._trace = None
-
-    def _standard_intent(self, name: str, scope: str, rating: str,
-                         mode: str, solo: bool, filtered: bool):
-        legacy_variant = re.fullmatch(r"(.+)[(（]([^()（）]+)[)）]", name)
-        if legacy_variant:
-            parent = self.index.resolve_character(legacy_variant.group(1))
-            if isinstance(parent, Resolved):
-                variant = self.index.resolve_variant(parent.character.id, legacy_variant.group(2))
-                if variant:
-                    return variant_intent(parent.character, variant, scope, rating), None
-        resolved = self.index.resolve_character(name, allow_legacy=True)
-        if isinstance(resolved, Resolved):
-            return character_intent(resolved.character, scope, rating, mode=mode,
-                                    solo=solo, filtered=filtered), None
-        if isinstance(resolved, LegacyQuery):
-            return SearchIntent(mode, resolved.alias, resolved.query, rating, solo, filtered, scope), None
-        return None, self._resolution_error(name, resolved)
-
-    async def _picture_command(self, event: AstrMessageEvent, command: str, kind: str):
-        if self.is_sending:
-            yield event.plain_result("⚠️ 上一张还在发送，请稍等")
-            return
-        self.is_sending = True
-        try:
-            name, rating, solo, filtered = self._parse_args(self._tail(event, command).split(), self._default_rating(event))
-            if not name:
-                yield event.plain_result(f"用法：{command} 角色名 [单人] [safe/r18] [筛选]")
+                wait_time = int(remaining) + 1
+                yield event.plain_result(f"⏳ R18 发送冷却中，请 {wait_time} 秒后重试")
                 return
+        
+        rating_display = {"all": "全随机", "r18": "R18", "safe": "全年龄"}[rating]
+        filter_text = " (筛选)" if filtered else ""
+        yield event.plain_result(f"{icon} {rating_display}{' (单人)' if solo else ''}{filter_text} | 正在获取 {name} 的图片...")
+        
+        for attempt in range(2):
+            if attempt > 0:
+                logger.info(f"[Danbooru] 第 {attempt+1} 次重试...")
+            
+            posts = await asyncio.to_thread(
+                self._fetch_image, tag, rating, order,
+                self.new_limit if order == "id_desc" else 200, filtered, solo_only,
+            )
+            if not posts:
+                continue
+
             scope = event.unified_msg_origin
-            if kind in {"random", "new"}:
-                intent, error = self._standard_intent(name, scope, rating, kind, solo, filtered)
-            else:
-                resolved = self.index.resolve_character(name)
-                if not isinstance(resolved, Resolved):
-                    intent, error = None, self._resolution_error(name, resolved)
-                elif solo or filtered:
-                    intent, error = None, "该玩法暂不组合单人或筛选选项"
-                elif kind == "curated":
-                    intent, error = curated_intent(resolved.character, scope, rating, self.featured_min_score), None
+            post = self._choose_post(posts, scope)
+            if not post:
+                continue
+            url = post.get("file_url") or post.get("large_file_url")
+            
+            img_bytes = await asyncio.to_thread(self._download, url)
+            if not img_bytes:
+                continue
+            
+            tmp_file = ""
+            try:
+                tmp_file = await asyncio.to_thread(self._compress, img_bytes)
+                if not tmp_file:
+                    continue
+                logger.info("[Danbooru] 发送中...")
+                
+                if rating == "r18":
+                    logger.info("[Danbooru] R18 模式，使用合并转发...")
+                    
+                    # 固定使用机器人自己的信息
+                    node = Node(
+                        uin=3159302040,
+                        name="艾莉丝",
+                        content=[Plain("📸"), AstrImage(file=tmp_file)]
+                    )
+                    
+                    self.last_r18_time = time()
+                    result = event.chain_result([node])
                 else:
-                    intent, error = week_intent(resolved.character, scope, rating), None
-            if error:
-                yield event.plain_result(error)
+                    chain = event.plain_result("")
+                    chain.chain = [AstrImage(file=tmp_file)]
+                    result = chain
+
+                self.recent_post_ids[scope].append(post["id"])
+                try:
+                    yield result
+                finally:
+                    asyncio.create_task(delay_delete_file(tmp_file, 60))
                 return
-            success, message = await self._deliver(event, intent)
-            if not success:
-                if "没有符合条件" in message and kind == "curated":
-                    message = f"没有找到评分高于 {self.featured_min_score} 的未发图片，可降低精选评分门槛"
-                elif "没有符合条件" in message and kind == "week":
-                    message = "过去 7 天没有符合条件的未发图片，可稍后等新投稿"
-                if message:
-                    yield event.plain_result(message)
-        finally:
-            self.is_sending = False
+            except asyncio.TimeoutError:
+                logger.warning(f"[Danbooru] 发送超时")
+                if tmp_file and os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except Exception as e:
+                logger.warning(f"[Danbooru] 发送失败: {e}")
+                if tmp_file and os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+        
+        yield event.plain_result("❌ 发送失败，请稍后重试")
 
     @filter.command("美图")
     async def meitu(self, event: AstrMessageEvent):
-        async for reply in self._picture_command(event, "美图", "random"):
-            yield reply
+        if self.is_sending:
+            yield event.plain_result("⚠️ 上一张还在发送，请稍等")
+            return
+        self.is_sending = True
+        try:
+            parts = event.message_str.replace("美图", "").strip().split()
+            name, rating, solo, filtered = self._parse_args(parts)
+            if not name:
+                yield event.plain_result("用法: 美图 角色名 [单人] [r18/safe] [筛选]")
+                return
+            if name not in self.characters_map:
+                yield event.plain_result(f"角色 [{name}] 不存在")
+                return
+            async for result in self._send_image(event, name, rating, solo, "random", "🎲", filtered):
+                yield result
+        finally:
+            self.is_sending = False
 
     @filter.command("新图")
     async def new_image(self, event: AstrMessageEvent):
-        async for reply in self._picture_command(event, "新图", "new"):
-            yield reply
-
-    @filter.command("精选")
-    async def curated(self, event: AstrMessageEvent):
-        async for reply in self._picture_command(event, "精选", "curated"):
-            yield reply
-
-    @filter.command("本周新图")
-    async def week_new(self, event: AstrMessageEvent):
-        async for reply in self._picture_command(event, "本周新图", "week"):
-            yield reply
-
-    @filter.command("查角色")
-    async def lookup_character(self, event: AstrMessageEvent):
-        name = self._tail(event, "查角色")
-        if not name:
-            yield event.plain_result("用法：查角色 胡桃 或 查角色 原神:胡桃")
-            return
-        found = self.index.resolve_character(name, allow_legacy=True)
-        if isinstance(found, Resolved):
-            record = found.character
-            aliases = " / ".join(record.aliases[:5])
-            variants = " / ".join(item.display_name for item in self.index.list_variants(record.id)[:8])
-            others = "、".join(f"{item.franchise_name}·{item.display_name}" for item in found.alternatives[:3])
-            text = f"📚 {record.display_name}｜{record.franchise_name}\n主标签：{record.base_tag}"
-            if aliases:
-                text += f"\n别名：{aliases}"
-            if variants:
-                text += f"\n已核对装扮：{variants}"
-            if others:
-                text += f"\n其他同名：{others}"
-            if record.tag_status != "active_exact":
-                text += "\n远程标签尚未核验"
-            text += f"\n用法：新图 {record.franchise_name}:{record.display_name}"
-            yield event.plain_result(text)
-        elif isinstance(found, LegacyQuery):
-            yield event.plain_result(f"“{name}”在旧映射中对应 {found.query}；尚未核验为人物")
-        else:
-            yield event.plain_result(self._resolution_error(name, found))
-
-    @filter.command("再来一张")
-    async def redraw(self, event: AstrMessageEvent):
         if self.is_sending:
             yield event.plain_result("⚠️ 上一张还在发送，请稍等")
             return
-        last = self.state.get_intent(event.unified_msg_origin, self._sender(event))
-        if not last:
-            yield event.plain_result("你还没抽过图，先试试 新图 胡桃")
-            return
         self.is_sending = True
         try:
-            success, message = await self._deliver(event, last.intent)
-            if not success and message:
-                yield event.plain_result(message)
-        finally:
-            self.is_sending = False
-
-    @filter.command("换一张")
-    async def redraw_alias(self, event: AstrMessageEvent):
-        async for reply in self.redraw(event):
-            yield reply
-
-    @filter.command("图片出处")
-    async def image_source(self, event: AstrMessageEvent):
-        post = self.state.get_delivered(event.unified_msg_origin)
-        decision = self.policy.decide(event.unified_msg_origin, bool(event.get_group_id()),
-                                      "r18" if post and post.rating == "e" else "all")
-        if not post or post.rating not in decision.allowed:
-            yield event.plain_result("本会话还没有可查询的已发送图片")
-            return
-        text = f"出处：https://danbooru.donmai.us/posts/{post.post_id}"
-        if post.artist_tags:
-            text += "\n画师标签：" + " / ".join(post.artist_tags[:3])
-        if post.created_at:
-            text += "\n收录：" + post.created_at.split("T", 1)[0]
-        yield event.plain_result(text)
-
-    @filter.command("上一张出处")
-    async def image_source_alias(self, event: AstrMessageEvent):
-        async for reply in self.image_source(event):
-            yield reply
-
-    @filter.command("随机角色")
-    async def random_character(self, event: AstrMessageEvent):
-        if self.is_sending:
-            yield event.plain_result("⚠️ 上一张还在发送，请稍等")
-            return
-        franchise = self._tail(event, "随机角色")
-        pool = self.index.eligible_characters(franchise)
-        if not pool:
-            yield event.plain_result("该作品暂无已核验的随机人物池；例如：随机角色 原神")
-            return
-        self.is_sending = True
-        try:
-            choices = random.sample(pool, min(2, len(pool)))
-            for record in choices:
-                intent = character_intent(record, event.unified_msg_origin, self._default_rating(event))
-                success, message = await self._deliver(event, intent,
-                                                 caption=f"随机角色：{record.franchise_name}·{record.display_name}",
-                                                 sample_attempts=1, extra_pages=0)
-                if success:
-                    return
-                if self._last_delivery_status in {"uncertain", "blocked", "failed"}:
-                    if message:
-                        yield event.plain_result(message)
-                    return
-            yield event.plain_result("这次随机人物没有找到可用新图，稍后再试")
-        finally:
-            self.is_sending = False
-
-    def _split_duo(self, text: str):
-        parts = text.split()
-        pairs = []
-        for split_at in range(1, len(parts)):
-            left_name, right_name = " ".join(parts[:split_at]), " ".join(parts[split_at:])
-            left, right = self.index.resolve_character(left_name), self.index.resolve_character(right_name)
-            if not isinstance(left, Resolved) or not isinstance(right, Resolved):
-                continue
-            if (left.alternatives and ":" not in left_name) or (right.alternatives and ":" not in right_name):
-                continue
-            pairs.append((left.character, right.character))
-        return pairs[0] if len(pairs) == 1 else None
-
-    @filter.command("合照")
-    async def duo(self, event: AstrMessageEvent):
-        if self.is_sending:
-            yield event.plain_result("⚠️ 上一张还在发送，请稍等")
-            return
-        names, rating, solo, filtered = self._parse_args(self._tail(event, "合照").split(), self._default_rating(event))
-        if solo or filtered:
-            yield event.plain_result("合照请只指定两个人物和分级；例如：合照 原神:胡桃 原神:芙宁娜 safe")
-            return
-        pair = self._split_duo(names)
-        if not pair:
-            yield event.plain_result("请指定两个明确人物；例如：合照 原神:胡桃 原神:芙宁娜")
-            return
-        try:
-            intent = duo_intent(*pair, event.unified_msg_origin, rating)
-        except ValueError as exc:
-            yield event.plain_result(str(exc))
-            return
-        self.is_sending = True
-        try:
-            success, message = await self._deliver(event, intent)
-            if not success and message:
-                yield event.plain_result("没有查到这两位同框的投稿" if "没有符合条件" in message else message)
-        finally:
-            self.is_sending = False
-
-    def _split_variant(self, text: str):
-        parts = text.split()
-        matches = []
-        for split_at in range(1, len(parts)):
-            char_name, variant_name = " ".join(parts[:split_at]), " ".join(parts[split_at:])
-            character = self.index.resolve_character(char_name)
-            if isinstance(character, Resolved):
-                variant = self.index.resolve_variant(character.character.id, variant_name)
-                if variant:
-                    matches.append((character.character, variant))
-        return matches[0] if len(matches) == 1 else None
-
-    @filter.command("装扮")
-    async def variant(self, event: AstrMessageEvent):
-        if self.is_sending:
-            yield event.plain_result("⚠️ 上一张还在发送，请稍等")
-            return
-        names, rating, solo, filtered = self._parse_args(self._tail(event, "装扮").split(), self._default_rating(event))
-        if solo or filtered:
-            yield event.plain_result("装扮暂不组合单人或筛选；例如：装扮 原神:胡桃 银河商店")
-            return
-        pair = self._split_variant(names)
-        if not pair:
-            yield event.plain_result("未找到已核对的该人物装扮；可先用 查角色 查看可选名称")
-            return
-        try:
-            intent = variant_intent(*pair, event.unified_msg_origin, rating)
-        except ValueError as exc:
-            yield event.plain_result(str(exc))
-            return
-        self.is_sending = True
-        try:
-            success, message = await self._deliver(event, intent)
-            if not success and message:
-                yield event.plain_result(message)
+            parts = event.message_str.replace("新图", "").strip().split()
+            name, rating, solo, filtered = self._parse_args(parts)
+            if not name:
+                yield event.plain_result("用法: 新图 角色名 [r18/safe] [筛选]")
+                return
+            if name not in self.characters_map:
+                yield event.plain_result(f"角色 [{name}] 不存在")
+                return
+            async for result in self._send_image(event, name, rating, solo, "id_desc", "🆕", filtered):
+                yield result
         finally:
             self.is_sending = False

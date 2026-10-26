@@ -2,6 +2,11 @@
 # 整合后的游戏字典
 
 RAW_DICT_GENSHIN_IMPACT = {
+    
+    "尘白禁区|尘白":"snowbreak:_containment_zone",
+    "辰星|姬辰星": "ji_chenxing",
+    "辰星云篆": "ji_chenxing_-_jade_arc",
+    "辰星琼弦": "ji_chenxing_-_ethereal_cloud ",
     "ass": "ass",
     "breasts": "breasts",
     "mygo": "bang_dream!_it's_mygo!!!!! ",
@@ -21,6 +26,9 @@ RAW_DICT_GENSHIN_IMPACT = {
     "迪迦": "ultraman_tiga_(series) ",
     "沃雅妮莎": "vodyanitsa_(genshin_impact)",
     "奥黛塔": "odette_(genshin_impact)",
+    "达妮卡": "danica_(genshin_impact)",
+    "薇斯纳": "vesna_(genshin_impact)",
+    "克拉蕾": "claret_flint",
     "绯英": "evanescia_(honkai:_star_rail) ",
     "清宵": "qingxiao_(wuthering_waves) ",
     "洛瑟菈":"lucilla_(wuthering_waves) ",
@@ -30,7 +38,7 @@ RAW_DICT_GENSHIN_IMPACT = {
     "希格莉德": "sigrid_de_l'azur ",
     "蕾米埃尔": "remielle_dan  ",    
     "维琳娜": "velina_airgid ",
-    "冬雪莲": "azuma_seren ~ azuma_seren_(new) ",
+    "冬雪莲|东雪莲": "azuma_seren",
     "若娜瓦|死之执政": "ronova_(genshin_impact) ",
     "特朗普|川普": "donald_trump ",
     "奶龙": "nailong_(character) ",
@@ -141,7 +149,8 @@ RAW_DICT_GENSHIN_IMPACT = {
     "菈乌玛": "lauma_(genshin_impact)",
     "班尼特|班神|倒霉蛋|六星战神": "bennett_(adventures_in_blazing_hue)_(genshin_impact)",
     "芙卡洛斯|水神|芙宁娜": "focalors_(genshin_impact)",
-    "女士|炎之魔女|第八席": "signora_(genshin_impact) ~ signora_(crimson_witch_of_embers)_(genshin_impact)",
+    "女士|第八席": "signora_(genshin_impact)",
+    "炎之魔女|燃烬魔女|灰烬魔女|魔女形态": "signora_(crimson_witch_of_embers)_(genshin_impact)",
     "希诺宁|锻造师|豹女": "xilonen_(genshin_impact)",
     "多托雷|博士|第二席": "dottore_(exalted_master_of_the_heretical_path)_(genshin_impact)",
     "瑶瑶|小瑶|月桂": "yaoyao_(rainlit_bamboo_reverie)_(genshin_impact)",
@@ -2255,4 +2264,14 @@ RAW_DICT_GENSHIN_IMPACT = {
     "Maika|舞花|Maika酱": "maika_(vocaloid)",
     "KAITO(猫电)|猫电KAITO|大哥猫电版": "kaito_(neko_cyber)_(vocaloid)",
     "KAITO(罪恶)|罪恶KAITO|大哥罪恶版": "kaito_(guilty)_(vocaloid)",
+
+    # === AI 拟人：DeepSeek 娘（2026-09-12 新增）===
+    # 实测: deepseek=15帖(最全) / deepseek-tan=14帖(角色) / deepseek_(medium)=2帖(早期,已被前两者覆盖)
+    # 注: Danbooru API 实测不支持 OR 语法(~ / or / {} / 逗号 均无效, 只取第一个tag)，故用覆盖面最全的单 tag
+    "deepseek|DeepSeek|deepseek娘|DeepSeek娘|深度求索|DS娘|ds娘|求索娘": "deepseek",
+    "deepseek-tan|deepseek角色|deepseek拟人": "deepseek-tan",
+    "deepseek媒介|deepseek原稿|deepseek早期": "deepseek_(medium)",
+
+    # === BanG Dream! 追加（2026-09-12）===
+    "薇欧拉|薇奥拉|维奥拉|viola|Viola": "viola_(bang_dream!)",
 }
