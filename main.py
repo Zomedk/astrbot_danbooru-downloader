@@ -29,6 +29,8 @@ from .session_policy import SessionPolicy
 from .send_service import DeliveryStatus, submit_one_image
 
 PLUGIN_NAME = "astrbot_danbooru_downloader"
+
+
 async def delay_delete_file(path: Path, delay: int = 60) -> None:
     await asyncio.sleep(delay)
     try:
@@ -53,7 +55,7 @@ class DanbooruDownloaderPlugin(Star):
         self.api_key = self.config.get("api_key") or ""
         self.proxy = self.config.get("proxy") or ""
         self.new_limit = _bounded(self.config.get("new_limit"), 100, 1, 200)
-        self.random_sample_limit = _bounded(self.config.get("random_sample_limit"), 30, 1, 200)
+        self.random_sample_limit = _bounded(self.config.get("random_sample_limit"), 100, 1, 200)
         self.new_max_extra_pages = _bounded(self.config.get("new_max_extra_pages"), 2, 0, 5)
         self.prefer_large_above_mib = _bounded(self.config.get("prefer_large_above_mib"), 3, 1, 16)
         self.featured_min_score = _bounded(self.config.get("featured_min_score"), 30, 0, 1000)
@@ -216,11 +218,14 @@ class DanbooruDownloaderPlugin(Star):
             async def fetch(plan, page):
                 return await self.api.fetch(plan, page, trace=trace)
 
+            async def count(tags):
+                return await self.api.count(tags, trace=trace)
+
             try:
                 selection = await self.search.select(
                     effective_intent, fetch, self.history,
                     excluded=self._excluded_ids(scope), allowed_ratings=decision.allowed,
-                    sample_attempts=sample_attempts, extra_pages=extra_pages,
+                    count=count, sample_attempts=sample_attempts, extra_pages=extra_pages,
                 )
             except PlanError as exc:
                 trace["reason"] = "query_plan"
@@ -239,7 +244,7 @@ class DanbooruDownloaderPlugin(Star):
             if not selection.posts:
                 trace["reason"] = "no_candidate"
                 self._last_delivery_status = "no_candidate"
-                return False, "最近候选已抽完或没有符合条件的图片，可稍后等新投稿"
+                return False, "候选已抽完或没有符合条件的图片，可稍后再试"
             for post in selection.posts[:1 + self.media_retry_candidates]:
                 post_id = int(post["id"])
                 trace["post_id"] = post_id
@@ -304,13 +309,31 @@ class DanbooruDownloaderPlugin(Star):
 
     def _standard_intent(self, name: str, scope: str, rating: str,
                          mode: str, solo: bool, filtered: bool, *, allow_variant: bool = True):
+        if "+" in name:
+            pair = [part.strip() for part in name.split("+")]
+            if len(pair) != 2 or not all(pair):
+                return None, "双人物请写成：原神:胡桃+原神:芙宁娜"
+            if solo:
+                return None, "双人物查询不能同时指定单人"
+            resolved = [self.index.resolve_character(part) for part in pair]
+            for part, result in zip(pair, resolved):
+                if not isinstance(result, Resolved):
+                    return None, self._resolution_error(part, result)
+                if result.alternatives and ":" not in part:
+                    return None, f"“{part}”对应多个人物，请指定作品"
+            try:
+                return duo_intent(resolved[0].character, resolved[1].character, scope,
+                                  rating, mode=mode, filtered=filtered), None
+            except ValueError as exc:
+                return None, str(exc)
         legacy_variant = re.fullmatch(r"(.+)[(（]([^()（）]+)[)）]", name) if allow_variant else None
         if legacy_variant:
             parent = self.index.resolve_character(legacy_variant.group(1))
             if isinstance(parent, Resolved):
                 variant = self.index.resolve_variant(parent.character.id, legacy_variant.group(2))
                 if variant:
-                    return variant_intent(parent.character, variant, scope, rating), None
+                    return variant_intent(parent.character, variant, scope, rating,
+                                          mode=mode, solo=solo, filtered=filtered), None
         resolved = self.index.resolve_character(name, allow_legacy=True)
         if isinstance(resolved, Resolved):
             return character_intent(resolved.character, scope, rating, mode=mode,
@@ -327,7 +350,10 @@ class DanbooruDownloaderPlugin(Star):
         try:
             name, rating, solo, filtered = self._parse_args(self._tail(event, command).split(), self._default_rating(event))
             if not name:
-                yield event.plain_result(f"用法：{command} 角色名 [单人] [safe/r18] [筛选]")
+                yield event.plain_result(
+                    f"用法：{command} 角色名 [单人] [safe/r18] [筛选]；"
+                    f"双人物：{command} 原神:胡桃+原神:芙宁娜"
+                )
                 return
             scope = event.unified_msg_origin
             mode = "random" if kind == "random" else "new"

@@ -1,7 +1,7 @@
 """Build Danbooru Member searches before making an API request."""
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 POST_FIELDS = (
     "id,rating,score,tag_string_general,tag_string_character,"
@@ -41,7 +41,7 @@ class QueryPlan:
     limit: int
     page: str | None
     local_filters: frozenset[str]
-    sampling_kind: str  # site_random or recent
+    sampling_kind: str  # site_random, random_page, or recent
     counted_tags: int
     notice: str = ""
     required_character_tags: tuple[str, ...] = ()
@@ -89,14 +89,13 @@ def _add_solo(tokens: list[str], intent: SearchIntent, base_count: int,
 
 def _add_sampling(tokens: list[str], intent: SearchIntent, base_count: int,
                   new_limit: int, random_sample_limit: int) -> tuple[str, int, str]:
-    if intent.mode == "random" and base_count < MAX_MEMBER_TAGS:
+    if intent.mode == "random":
         sample = max(1, min(int(random_sample_limit), 200))
-        if intent.solo:
-            sample = max(sample, 50)
-        tokens.append(f"random:{sample}")
-        return "site_random", sample, ""
-    notice = "本次改为近期随机：角色映射已占满免费标签名额" if intent.mode == "random" else ""
-    return "recent", max(1, min(int(new_limit), 200)), notice
+        if base_count < MAX_MEMBER_TAGS:
+            tokens.append(f"random:{sample}")
+            return "site_random", sample, ""
+        return "random_page", sample, ""
+    return "recent", max(1, min(int(new_limit), 200)), ""
 
 
 def _add_rating(tokens: list[str], intent: SearchIntent) -> None:
@@ -125,7 +124,7 @@ def _add_extra_metatags(tokens: list[str], intent: SearchIntent) -> int | None:
 
 
 def build_query_plan(intent: SearchIntent, *, new_limit: int = 100,
-                     random_sample_limit: int = 30) -> QueryPlan:
+                     random_sample_limit: int = 100) -> QueryPlan:
     """Compose mapping, options, sampling, rating and free metatags once."""
     if intent.mode not in {"new", "random"} or intent.rating not in {"safe", "all", "r18"}:
         raise PlanError("不支持的查询方式或分级")
@@ -147,9 +146,3 @@ def build_query_plan(intent: SearchIntent, *, new_limit: int = 100,
     return QueryPlan(" ".join(tokens), limit, None, frozenset(local_filters),
                      kind, counted, notice, intent.required_character_tags,
                      intent.max_age_days, minimum_score)
-
-
-def recent_fallback(intent: SearchIntent, *, new_limit: int = 100) -> QueryPlan:
-    """Keep solo when a random sample contains no usable solo posts."""
-    plan = build_query_plan(replace(intent, mode="new"), new_limit=new_limit)
-    return replace(plan, notice="本次改为近期随机（保留单人条件）")

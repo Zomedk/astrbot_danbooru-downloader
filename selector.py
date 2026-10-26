@@ -101,20 +101,15 @@ async def choose_new(plan: QueryPlan, fetch: Callable[[QueryPlan, str | None], A
 
 async def choose_random(plan: QueryPlan, fetch: Callable[[QueryPlan, str | None], Awaitable[list[dict]]],
                         history, scope: str, rating: str, *, excluded: set[int] | None = None,
-                        fallback: QueryPlan | None = None, extra_pages: int = 2,
+                        pages: list[str | None] | None = None,
                         sample_attempts: int = 2,
                         allowed_ratings: frozenset[str] | None = None) -> Selection:
-    if plan.sampling_kind == "recent":
-        return await choose_new(plan, fetch, history, scope, rating,
-                                extra_pages=extra_pages, excluded=excluded,
-                                allowed_ratings=allowed_ratings)
-    for _ in range(max(1, sample_attempts)):
-        posts = await fetch(plan, None)
+    if plan.sampling_kind not in {"site_random", "random_page"}:
+        raise ValueError("随机选择需要随机查询计划")
+    attempts = pages if pages is not None else [None] * max(1, sample_attempts)
+    for index, page in enumerate(attempts):
+        posts = await fetch(plan, page)
         candidates = eligible_posts(posts, rating, plan, history, scope, excluded or set(), allowed_ratings)
         if candidates:
-            return Selection(candidates)
-    if fallback:
-        return await choose_new(fallback, fetch, history, scope, rating,
-                                extra_pages=extra_pages, excluded=excluded,
-                                allowed_ratings=allowed_ratings)
-    return Selection([])
+            return Selection(candidates, plan.notice, index)
+    return Selection([], plan.notice)

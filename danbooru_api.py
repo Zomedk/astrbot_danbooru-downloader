@@ -7,7 +7,9 @@ import requests
 
 
 BASE_URL = "https://danbooru.donmai.us/posts.json"
+COUNT_URL = "https://danbooru.donmai.us/counts/posts.json"
 TRANSIENT_STATUSES = {429, 500, 502, 503}
+COUNT_CACHE_SECONDS = 300
 
 
 class FetchError(RuntimeError):
@@ -40,8 +42,9 @@ class DanbooruApiClient:
         self.sleeper = sleeper
         self.timer = timer
         self._last_call = 0.0
+        self._count_cache: dict[str, tuple[float, int]] = {}
 
-    def fetch_posts(self, plan, page: str | None = None, *, trace: dict | None = None) -> list[dict]:
+    def _get_json(self, url: str, params: dict, trace: dict | None):
         for attempt in range(self.retry_limit + 1):
             if trace is not None and trace["request_count"] >= self.request_budget:
                 raise QueryBudgetError("per-command API budget exhausted")
@@ -54,7 +57,7 @@ class DanbooruApiClient:
             started = self.timer()
             try:
                 response = self.session.get(
-                    BASE_URL, params=plan.params(page), auth=self.auth,
+                    url, params=params, auth=self.auth,
                     proxies=self.proxies, timeout=(5, 15),
                 )
                 try:
@@ -70,10 +73,7 @@ class DanbooruApiClient:
                                 self.sleeper(max(1.0, retry_seconds))
                                 continue
                         raise FetchError(status)
-                    posts = response.json()
-                    if not isinstance(posts, list):
-                        raise ValueError("Danbooru 返回内容不是帖子列表")
-                    return posts
+                    return response.json()
                 finally:
                     response.close()
             except requests.RequestException:
@@ -83,7 +83,30 @@ class DanbooruApiClient:
             finally:
                 if trace is not None:
                     trace["api_ms"] += int((self.timer() - started) * 1000)
-        return []
+        raise RuntimeError("Danbooru request retry loop exhausted")
+
+    def fetch_posts(self, plan, page: str | None = None, *, trace: dict | None = None) -> list[dict]:
+        posts = self._get_json(BASE_URL, plan.params(page), trace)
+        if not isinstance(posts, list):
+            raise ValueError("Danbooru 返回内容不是帖子列表")
+        return posts
+
+    def count_posts(self, tags: str, *, trace: dict | None = None) -> int:
+        cached = self._count_cache.get(tags)
+        if cached and self.clock() - cached[0] < COUNT_CACHE_SECONDS:
+            return cached[1]
+        result = self._get_json(COUNT_URL, {"tags": tags}, trace)
+        try:
+            count = int(result["counts"]["posts"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Danbooru 返回的投稿数量无效") from exc
+        if count < 0:
+            raise ValueError("Danbooru 返回的投稿数量无效")
+        self._count_cache[tags] = (self.clock(), count)
+        return count
 
     async def fetch(self, plan, page: str | None = None, *, trace: dict | None = None) -> list[dict]:
         return await asyncio.to_thread(self.fetch_posts, plan, page, trace=trace)
+
+    async def count(self, tags: str, *, trace: dict | None = None) -> int:
+        return await asyncio.to_thread(self.count_posts, tags, trace=trace)

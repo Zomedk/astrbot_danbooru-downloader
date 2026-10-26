@@ -34,8 +34,8 @@
     "random_sample_limit": {
         "description": "美图随机样本数量",
         "type": "int",
-        "hint": "默认 30；单人模式至少取 50 个样本并在本地筛选",
-        "default": 30
+        "hint": "每次重新取随机候选，默认 100，范围 1-200；双人物查询从随机页面取候选",
+        "default": 100
     },
     "history_max_per_session": {
         "description": "每会话保留的已发帖子数",
