@@ -21,7 +21,7 @@ from .danbooru_api import DanbooruApiClient, FetchError, QueryBudgetError
 from .history_store import HistoryStore, PendingSendStore
 from .mapping import RAW_DICT_GENSHIN_IMPACT
 from .media import choose_media_url, download_image, prepare_image
-from .play_modes import character_intent, curated_intent, duo_intent, variant_intent, week_intent
+from .play_modes import character_intent, duo_intent, variant_intent, with_curated, with_week
 from .query_planner import PlanError, SearchIntent
 from .search_service import SearchService
 from .session_state import SessionState
@@ -303,8 +303,8 @@ class DanbooruDownloaderPlugin(Star):
                         f"reason={trace['reason']} total_ms={int((perf_counter()-started)*1000)}")
 
     def _standard_intent(self, name: str, scope: str, rating: str,
-                         mode: str, solo: bool, filtered: bool):
-        legacy_variant = re.fullmatch(r"(.+)[(（]([^()（）]+)[)）]", name)
+                         mode: str, solo: bool, filtered: bool, *, allow_variant: bool = True):
+        legacy_variant = re.fullmatch(r"(.+)[(（]([^()（）]+)[)）]", name) if allow_variant else None
         if legacy_variant:
             parent = self.index.resolve_character(legacy_variant.group(1))
             if isinstance(parent, Resolved):
@@ -330,21 +330,18 @@ class DanbooruDownloaderPlugin(Star):
                 yield event.plain_result(f"用法：{command} 角色名 [单人] [safe/r18] [筛选]")
                 return
             scope = event.unified_msg_origin
-            if kind in {"random", "new"}:
-                intent, error = self._standard_intent(name, scope, rating, kind, solo, filtered)
-            else:
-                resolved = self.index.resolve_character(name)
-                if not isinstance(resolved, Resolved):
-                    intent, error = None, self._resolution_error(name, resolved)
-                elif solo or filtered:
-                    intent, error = None, "该玩法暂不组合单人或筛选选项"
-                elif kind == "curated":
-                    intent, error = curated_intent(resolved.character, scope, rating, self.featured_min_score), None
-                else:
-                    intent, error = week_intent(resolved.character, scope, rating), None
+            mode = "random" if kind == "random" else "new"
+            intent, error = self._standard_intent(
+                name, scope, rating, mode, solo, filtered,
+                allow_variant=kind in {"random", "new"},
+            )
             if error:
                 yield event.plain_result(error)
                 return
+            if kind == "curated":
+                intent = with_curated(intent, self.featured_min_score)
+            elif kind == "week":
+                intent = with_week(intent)
             success, message = await self._deliver(event, intent)
             if not success:
                 if "没有符合条件" in message and kind == "curated":

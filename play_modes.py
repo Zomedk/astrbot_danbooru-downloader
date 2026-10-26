@@ -1,5 +1,7 @@
 """Turn second-phase commands into the first-phase structured search intent."""
 
+from dataclasses import replace
+
 if __package__:
     from .query_planner import SearchIntent
 else:  # Direct local tests
@@ -11,15 +13,28 @@ def character_intent(record, scope: str, rating: str, *, mode: str = "random",
     return SearchIntent(mode, record.id, record.base_tag, rating, solo, filtered, scope)
 
 
-def curated_intent(record, scope: str, rating: str, minimum_score: int = 30) -> SearchIntent:
+def with_curated(base: SearchIntent, minimum_score: int = 30) -> SearchIntent:
+    """Add a score threshold to any character query without losing its options."""
     score = max(0, min(int(minimum_score), 1000))
-    return SearchIntent("new", record.id, record.base_tag, rating, False, False,
-                        scope, (f"score:>{score}",))
+    return replace(base, mode="new", extra_metatags=base.extra_metatags + (f"score:>{score}",))
 
 
-def week_intent(record, scope: str, rating: str) -> SearchIntent:
-    return SearchIntent("new", record.id, record.base_tag, rating, False, False,
-                        scope, ("age:<7d",), (), 7)
+def with_week(base: SearchIntent) -> SearchIntent:
+    """Add a seven-day window without losing solo, rating or score options."""
+    return replace(base, mode="new", extra_metatags=base.extra_metatags + ("age:<7d",),
+                   max_age_days=7)
+
+
+def curated_intent(record, scope: str, rating: str, minimum_score: int = 30,
+                   *, solo: bool = False, filtered: bool = False) -> SearchIntent:
+    return with_curated(character_intent(record, scope, rating, mode="new",
+                                         solo=solo, filtered=filtered), minimum_score)
+
+
+def week_intent(record, scope: str, rating: str, *, solo: bool = False,
+                filtered: bool = False) -> SearchIntent:
+    return with_week(character_intent(record, scope, rating, mode="new",
+                                      solo=solo, filtered=filtered))
 
 
 def duo_intent(first, second, scope: str, rating: str) -> SearchIntent:

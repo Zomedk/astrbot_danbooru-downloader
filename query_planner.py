@@ -99,29 +99,28 @@ def _add_sampling(tokens: list[str], intent: SearchIntent, base_count: int,
     return "recent", max(1, min(int(new_limit), 200)), notice
 
 
-def _add_rating_and_score(tokens: list[str], intent: SearchIntent) -> int | None:
+def _add_rating(tokens: list[str], intent: SearchIntent) -> None:
     if intent.rating == "safe":
         tokens.append("rating:g")
     elif intent.rating == "r18":
         tokens.append("rating:e")
-    if intent.filtered:
-        tokens.append("score:>30")
-    return 30 if intent.filtered else None
 
 
-def _add_extra_metatags(tokens: list[str], intent: SearchIntent,
-                        minimum_score: int | None) -> int | None:
+def _add_extra_metatags(tokens: list[str], intent: SearchIntent) -> int | None:
+    minimum_score = 30 if intent.filtered else None
     for extra in intent.extra_metatags:
         if extra == "age:<7d":
             if intent.max_age_days != 7:
                 raise PlanError("本周新图时间条件无效")
+            if extra not in tokens:
+                tokens.append(extra)
         elif re.fullmatch(r"score:>[0-9]{1,4}", extra):
             value = int(extra.split(">", 1)[1])
             minimum_score = max(minimum_score or 0, value)
         else:
             raise PlanError("不支持的额外查询条件")
-        if extra not in tokens:
-            tokens.append(extra)
+    if minimum_score is not None:
+        tokens.append(f"score:>{minimum_score}")
     return minimum_score
 
 
@@ -139,8 +138,8 @@ def build_query_plan(intent: SearchIntent, *, new_limit: int = 100,
     _add_solo(tokens, intent, base_count, local_filters)
     kind, limit, notice = _add_sampling(tokens, intent, base_count,
                                         new_limit, random_sample_limit)
-    minimum_score = _add_rating_and_score(tokens, intent)
-    minimum_score = _add_extra_metatags(tokens, intent, minimum_score)
+    _add_rating(tokens, intent)
+    minimum_score = _add_extra_metatags(tokens, intent)
 
     counted = _counted(tokens)
     if counted > MAX_MEMBER_TAGS:
